@@ -23,6 +23,7 @@ mod runtime;
 mod runtime_mutations;
 mod session;
 pub mod state;
+pub(crate) mod system_resources;
 mod tab_bar_status;
 mod terminal_targets;
 mod terminal_titles;
@@ -118,6 +119,9 @@ pub struct App {
     pub(crate) last_api_notification_at: Option<Instant>,
     pub(crate) last_git_remote_status_refresh: Instant,
     pub(crate) last_git_repo_discovery_refresh: Instant,
+    /// `None` until the first host resource sample, which makes the first
+    /// reading due immediately instead of one interval late.
+    pub(crate) last_system_resource_refresh: Option<Instant>,
     pub(crate) git_refresh_in_flight: bool,
     pub(crate) git_refresh_due_after_in_flight: bool,
     pub(crate) git_identity_refresh_requested: bool,
@@ -638,6 +642,8 @@ impl App {
             agent_view_override: None,
             sidebar_agents: config.ui.sidebar.agents.clone(),
             sidebar_spaces: config.ui.sidebar.spaces.clone(),
+            sidebar_resources: config.ui.sidebar.resources.clone(),
+            system_resources: system_resources::SystemResources::default(),
             next_agent_state_change_seq: 0,
             mouse_capture: config.ui.mouse_capture,
             copy_on_select: config.ui.copy_on_select,
@@ -752,6 +758,7 @@ impl App {
             event_tx,
             event_rx,
             last_git_remote_status_refresh: Instant::now() - GIT_REMOTE_STATUS_REFRESH_INTERVAL,
+            last_system_resource_refresh: None,
             last_git_repo_discovery_refresh: Instant::now(),
             git_refresh_in_flight: false,
             git_refresh_due_after_in_flight: false,
@@ -1511,6 +1518,7 @@ impl App {
                 self.state.status_indicators = config.ui.status_indicators;
                 self.state.sidebar_agents = config.ui.sidebar.agents.clone();
                 self.state.sidebar_spaces = config.ui.sidebar.spaces.clone();
+                self.state.sidebar_resources = config.ui.sidebar.resources.clone();
                 self.state.agent_panel_scroll = 0;
                 self.state.accent = crate::config::parse_color(&config.ui.accent);
                 if !self.state.local_sound_playback && self.state.sound != config.ui.sound {

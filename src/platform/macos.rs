@@ -9,7 +9,7 @@ use std::sync::OnceLock;
 
 use super::{
     read_limited_reader, ClipboardCommand, ClipboardImage, ForegroundJob, ForegroundProcess,
-    LimitedRead, Signal,
+    LimitedRead, Signal, SystemResourceSample,
 };
 
 pub(crate) use super::unix_common::{
@@ -994,6 +994,65 @@ pub fn process_exists(pid: u32) -> bool {
     }
 }
 
+/// APFS Data volume that holds user and application data.
+///
+/// `statfs` on this path reports the space a process can actually claim.
+/// Finder and System Settings instead add reclaimable purgeable space to their
+/// "available" figure, which overstates the headroom a build or install has.
+const DATA_VOLUME_PATH: &str = "/System/Volumes/Data";
+
+/// Reads host disk and swap pressure through `statfs` and `sysctlbyname`.
+///
+/// Both are direct syscalls against already-resident kernel counters, so this
+/// costs microseconds and never spawns a process.
+pub fn system_resource_sample() -> SystemResourceSample {
+    SystemResourceSample {
+        disk_available_bytes: available_disk_bytes(Path::new(DATA_VOLUME_PATH))
+            .or_else(|| available_disk_bytes(Path::new("/"))),
+        swap_used_bytes: swap_used_bytes(),
+    }
+}
+
+/// Space available to an unprivileged process, matching `df` rather than Finder.
+///
+/// Uses `f_bavail`, which excludes both the root reserve and purgeable space,
+/// so the reading tracks `df -h` and `diskutil info` free space.
+fn available_disk_bytes(path: &Path) -> Option<u64> {
+    let path = std::ffi::CString::new(path.as_os_str().as_bytes()).ok()?;
+    let mut stat = std::mem::MaybeUninit::<libc::statfs>::uninit();
+    // SAFETY: `path` is a valid NUL-terminated C string and `stat` is a
+    // correctly sized, writable `statfs` allocation the call fills in.
+    if unsafe { libc::statfs(path.as_ptr(), stat.as_mut_ptr()) } != 0 {
+        return None;
+    }
+    // SAFETY: `statfs` returned success, so the buffer is initialized.
+    let stat = unsafe { stat.assume_init() };
+    u64::from(stat.f_bsize).checked_mul(stat.f_bavail)
+}
+
+/// Swap bytes in use, mirroring the `used` field of `sysctl vm.swapusage`.
+fn swap_used_bytes() -> Option<u64> {
+    let name = std::ffi::CString::new("vm.swapusage").ok()?;
+    let mut usage = std::mem::MaybeUninit::<libc::xsw_usage>::uninit();
+    let mut len = std::mem::size_of::<libc::xsw_usage>();
+    // SAFETY: `name` is a valid NUL-terminated sysctl name and `usage` is a
+    // correctly sized `xsw_usage` allocation matching the advertised `len`.
+    let result = unsafe {
+        libc::sysctlbyname(
+            name.as_ptr(),
+            usage.as_mut_ptr().cast::<libc::c_void>(),
+            &mut len,
+            std::ptr::null_mut(),
+            0,
+        )
+    };
+    if result != 0 || len != std::mem::size_of::<libc::xsw_usage>() {
+        return None;
+    }
+    // SAFETY: the call succeeded and filled a full `xsw_usage`.
+    Some(unsafe { usage.assume_init() }.xsu_used)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1213,5 +1272,28 @@ printf '%s\n' "$@" > "$HERDR_NOTIFY_ARGS"
         assert_eq!(argv[1], "-c");
         assert!(argv[2].contains("EDITOR:-vi"));
         assert!(argv[2].contains("/tmp/herdr scrollback.txt"));
+    }
+
+    #[test]
+    fn available_disk_bytes_tracks_the_data_volume_and_rejects_missing_paths() {
+        let data_volume = available_disk_bytes(Path::new(DATA_VOLUME_PATH))
+            .expect("the data volume should report available space");
+        let root = available_disk_bytes(Path::new("/")).expect("root should report space");
+
+        assert!(data_volume > 0);
+        // Both paths resolve to the same APFS container on a stock install.
+        assert_eq!(data_volume, root);
+        assert_eq!(
+            available_disk_bytes(Path::new("/herdr/missing/volume")),
+            None
+        );
+    }
+
+    #[test]
+    fn system_resource_sample_reports_both_readings() {
+        let sample = system_resource_sample();
+
+        assert!(sample.disk_available_bytes.is_some_and(|bytes| bytes > 0));
+        assert!(sample.swap_used_bytes.is_some());
     }
 }

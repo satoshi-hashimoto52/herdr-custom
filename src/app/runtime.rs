@@ -386,6 +386,7 @@ impl App {
 
         changed |= self.expire_due_metadata(now);
         changed |= self.handle_tab_bar_status_tasks(now);
+        changed |= self.handle_system_resource_refresh(now);
 
         if geometry_dirty || resized {
             self.pending_agent_resume_deadline = None;
@@ -600,7 +601,9 @@ impl App {
         now: Instant,
         needs_render: bool,
         include_resize_poll: bool,
-        include_git_refresh: bool,
+        // Gates refreshes that only matter while a client is watching the UI:
+        // sidebar Git status, and the sidebar's host resource footer.
+        include_client_visible_refresh: bool,
     ) -> Option<Instant> {
         let render_deadline = if needs_render {
             self.last_render_at
@@ -617,7 +620,7 @@ impl App {
             self.state.next_pending_agent_notification_deadline(),
             self.state.next_managed_agent_deadline(),
             self.copy_feedback_deadline,
-            include_git_refresh
+            include_client_visible_refresh
                 .then(|| self.git_refresh_deadline())
                 .flatten(),
             self.next_auto_update_check,
@@ -628,6 +631,9 @@ impl App {
             self.selection_autoscroll_deadline,
             self.selection_highlight_clear_deadline,
             self.next_tab_bar_status_deadline(),
+            include_client_visible_refresh
+                .then(|| self.next_system_resource_deadline())
+                .flatten(),
             render_deadline,
         ]
         .into_iter()

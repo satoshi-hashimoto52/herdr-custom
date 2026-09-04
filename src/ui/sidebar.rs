@@ -10,9 +10,13 @@ use ratatui::{
 
 use self::tokens::{ResolvedToken, ResolvedTokenKind, SpaceTokenContext};
 use super::scrollbar::{render_scrollbar, should_show_scrollbar};
-use super::status::{state_icon, state_label, state_label_color};
+use super::status::{
+    pane_state_icon, pane_state_label, pane_state_label_color, pane_status_key, state_icon,
+    state_label, state_label_color,
+};
 use super::text::{display_width, display_width_u16, truncate_end};
 use crate::app::state::{AgentPanelSort, Palette};
+use crate::app::system_resources::ResourcePressure;
 use crate::app::{AppState, Mode};
 use crate::detect::AgentState;
 use crate::terminal::TerminalRuntimeRegistry;
@@ -34,6 +38,8 @@ pub(crate) struct AgentPanelEntry {
     pub agent: Option<crate::detect::Agent>,
     pub state: AgentState,
     pub seen: bool,
+    /// Agent process died mid-turn; shown as `error`.
+    pub errored: bool,
     pub last_agent_state_change_seq: Option<u64>,
     pub state_labels: std::collections::HashMap<String, String>,
     pub tokens: std::collections::HashMap<String, String>,
@@ -56,25 +62,91 @@ fn sidebar_section_heights(total_h: u16, split_ratio: f32) -> (u16, u16) {
     (ws_h, detail_h)
 }
 
-pub(crate) fn expanded_sidebar_sections(area: Rect, split_ratio: f32) -> (Rect, Rect) {
+/// Rows the pinned resource footer claims: a divider plus one line each for
+/// disk and swap.
+const SIDEBAR_FOOTER_ROWS: u16 = 3;
+
+/// Rows the Spaces and Agents sections keep before the footer may claim any,
+/// matching the floor `sidebar_section_heights` already enforces.
+const MIN_SIDEBAR_SECTION_ROWS: u16 = 6;
+
+/// Height available to the two scrolling sections, once the footer is reserved.
+///
+/// Taking the footer out here is what pins it: every section rect, scroll
+/// metric, and click target downstream is derived from this same figure, so the
+/// Agents list scrolls within what is left instead of running under the footer.
+fn sidebar_sections_height(content: Rect, footer_rows: u16) -> u16 {
+    content
+        .height
+        .saturating_sub(fitted_footer_rows(content, footer_rows))
+}
+
+/// Footer rows that actually fit, all or nothing.
+///
+/// A partial footer would show a divider with one reading under it, and a
+/// sidebar narrower than the abbreviated form could only cut a number
+/// mid-digit. Either way the rows go back to the sections instead.
+fn fitted_footer_rows(content: Rect, footer_rows: u16) -> u16 {
+    let fits = footer_rows > 0
+        && content.height >= MIN_SIDEBAR_SECTION_ROWS.saturating_add(footer_rows)
+        && content.width.saturating_sub(1) >= FOOTER_MIN_WIDTH;
+    if fits {
+        footer_rows
+    } else {
+        0
+    }
+}
+
+/// Rows the footer wants, or zero when it is off or has nothing to report.
+pub(crate) fn sidebar_footer_rows(app: &AppState) -> u16 {
+    if app.sidebar_resources.enabled && !app.system_resources.is_empty() {
+        SIDEBAR_FOOTER_ROWS
+    } else {
+        0
+    }
+}
+
+/// The footer's own rows, pinned to the bottom of the sidebar.
+pub(crate) fn sidebar_footer_rect(area: Rect, footer_rows: u16) -> Rect {
+    let content = Rect::new(area.x, area.y, area.width.saturating_sub(1), area.height);
+    let rows = fitted_footer_rows(content, footer_rows);
+    if content.width == 0 || rows == 0 {
+        return Rect::default();
+    }
+
+    Rect::new(
+        content.x,
+        content.y + content.height.saturating_sub(rows),
+        content.width,
+        rows,
+    )
+}
+
+pub(crate) fn expanded_sidebar_sections(
+    area: Rect,
+    split_ratio: f32,
+    footer_rows: u16,
+) -> (Rect, Rect) {
     let content = Rect::new(area.x, area.y, area.width.saturating_sub(1), area.height);
     if content.width == 0 || content.height == 0 {
         return (Rect::default(), Rect::default());
     }
 
-    let (ws_h, detail_h) = sidebar_section_heights(content.height, split_ratio);
+    let sections_h = sidebar_sections_height(content, footer_rows);
+    let (ws_h, detail_h) = sidebar_section_heights(sections_h, split_ratio);
     let ws_area = Rect::new(content.x, content.y, content.width, ws_h);
     let detail_area = Rect::new(content.x, content.y + ws_h, content.width, detail_h);
     (ws_area, detail_area)
 }
 
-pub(crate) fn sidebar_section_divider_rect(area: Rect, split_ratio: f32) -> Rect {
+pub(crate) fn sidebar_section_divider_rect(area: Rect, split_ratio: f32, footer_rows: u16) -> Rect {
     let content = Rect::new(area.x, area.y, area.width.saturating_sub(1), area.height);
-    if content.width == 0 || content.height < 6 {
+    let sections_h = sidebar_sections_height(content, footer_rows);
+    if content.width == 0 || sections_h < 6 {
         return Rect::default();
     }
 
-    let (ws_h, _) = sidebar_section_heights(content.height, split_ratio);
+    let (ws_h, _) = sidebar_section_heights(sections_h, split_ratio);
     Rect::new(content.x, content.y + ws_h, content.width, 1)
 }
 
@@ -174,6 +246,7 @@ fn collect_agent_panel_entries_with_runtimes(
                         agent: detail.agent,
                         state: detail.state,
                         seen: detail.seen,
+                        errored: detail.errored,
                         last_agent_state_change_seq: detail.last_agent_state_change_seq,
                         state_labels: detail.state_labels,
                         tokens: detail.tokens,
@@ -183,14 +256,8 @@ fn collect_agent_panel_entries_with_runtimes(
         .collect()
 }
 
-pub(super) fn agent_panel_status_key(state: AgentState, seen: bool) -> &'static str {
-    match (state, seen) {
-        (AgentState::Idle, false) => "done",
-        (AgentState::Idle, true) => "idle",
-        (AgentState::Working, _) => "working",
-        (AgentState::Blocked, _) => "blocked",
-        (AgentState::Unknown, _) => "unknown",
-    }
+pub(super) fn agent_panel_status_key(state: AgentState, seen: bool, errored: bool) -> &'static str {
+    pane_status_key(state, seen, errored)
 }
 
 fn workspace_row_height(app: &AppState, ws: &crate::workspace::Workspace, indented: bool) -> u16 {
@@ -311,7 +378,7 @@ pub(crate) fn next_entry_is_indented_workspace(entries: &[WorkspaceListEntry], i
 }
 
 pub(crate) fn normalized_workspace_scroll(app: &AppState, area: Rect, requested: usize) -> usize {
-    let ws_area = workspace_list_rect(area, app.sidebar_section_split);
+    let ws_area = workspace_list_rect(area, app.sidebar_section_split, sidebar_footer_rows(app));
     let body = workspace_list_body_rect(ws_area, false);
     if body.height == 0 {
         return requested;
@@ -435,8 +502,8 @@ fn workspace_list_entries_inner(app: &AppState, force_expanded: bool) -> Vec<Wor
     entries
 }
 
-pub(crate) fn workspace_list_rect(area: Rect, split_ratio: f32) -> Rect {
-    let (ws_area, _) = expanded_sidebar_sections(area, split_ratio);
+pub(crate) fn workspace_list_rect(area: Rect, split_ratio: f32, footer_rows: u16) -> Rect {
+    let (ws_area, _) = expanded_sidebar_sections(area, split_ratio, footer_rows);
     ws_area
 }
 
@@ -545,9 +612,13 @@ pub(crate) fn agent_panel_body_rect(area: Rect, has_scrollbar: bool) -> Rect {
 fn resolved_agent_rows(app: &AppState, entry: &AgentPanelEntry) -> Vec<Vec<ResolvedToken>> {
     let label = entry
         .state_labels
-        .get(agent_panel_status_key(entry.state, entry.seen))
+        .get(agent_panel_status_key(
+            entry.state,
+            entry.seen,
+            entry.errored,
+        ))
         .map(String::as_str)
-        .unwrap_or_else(|| state_label(entry.state, entry.seen));
+        .unwrap_or_else(|| pane_state_label(entry.state, entry.seen, entry.errored));
     tokens::agent_rows(&app.sidebar_agents, entry, label)
 }
 
@@ -659,7 +730,7 @@ pub(crate) fn compute_workspace_list_areas(
     app: &AppState,
     area: Rect,
 ) -> (Vec<crate::app::state::WorkspaceCardArea>, Vec<()>) {
-    let ws_area = workspace_list_rect(area, app.sidebar_section_split);
+    let ws_area = workspace_list_rect(area, app.sidebar_section_split, sidebar_footer_rows(app));
     if ws_area == Rect::default() {
         return (Vec::new(), Vec::new());
     }
@@ -859,8 +930,13 @@ pub(super) fn render_sidebar_collapsed(app: &AppState, frame: &mut Frame, area: 
             } else {
                 Style::default().fg(p.overlay0)
             };
-            let (icon, icon_style) =
-                state_icon(detail.state, detail.seen, app.status_indicators, p);
+            let (icon, icon_style) = pane_state_icon(
+                detail.state,
+                detail.seen,
+                detail.errored,
+                app.status_indicators,
+                p,
+            );
 
             if is_active {
                 let buf = frame.buffer_mut();
@@ -1002,11 +1078,151 @@ pub(super) fn render_sidebar(
         buf[(sep_x, y)].set_style(sep_style);
     }
 
-    let (ws_area, detail_area) = expanded_sidebar_sections(area, app.sidebar_section_split);
+    let footer_rows = sidebar_footer_rows(app);
+    let (ws_area, detail_area) =
+        expanded_sidebar_sections(area, app.sidebar_section_split, footer_rows);
 
     render_workspace_list(app, terminal_runtimes, frame, ws_area, is_navigating);
     render_agent_detail(app, terminal_runtimes, frame, detail_area);
+    render_sidebar_resources(app, frame, sidebar_footer_rect(area, footer_rows));
     render_sidebar_toggle(app, frame, area, false, p);
+}
+
+/// Decimal gigabyte, matching how `diskutil` and storage vendors report sizes.
+const BYTES_PER_GB: f64 = 1_000_000_000.0;
+
+/// Narrowest footer content that still fits ` SWAP  0.0 GB`.
+const FOOTER_WIDE_MIN_WIDTH: u16 = 13;
+
+/// Narrowest footer content that still fits the abbreviated ` SWAP 0.0G`.
+///
+/// Below this the readings would have to be cut mid-number, so the footer
+/// hides instead and gives its rows back to the Agents list.
+const FOOTER_MIN_WIDTH: u16 = 10;
+
+/// Column the reading starts at, so the `SSD` and `SWAP` values line up.
+///
+/// The abbreviated form pulls in by one to buy a column back for the number.
+const FOOTER_LABEL_COLUMN: usize = 6;
+const FOOTER_LABEL_COLUMN_NARROW: usize = 5;
+
+/// Formats a reading for the roomy footer, keeping a tenth of a gigabyte once
+/// the number is small enough for that tenth to matter.
+fn format_resource_gb(bytes: u64) -> String {
+    let gb = bytes as f64 / BYTES_PER_GB;
+    if gb >= 10.0 {
+        format!("{gb:.0} GB")
+    } else {
+        format!("{gb:.1} GB")
+    }
+}
+
+/// Formats a reading for a narrow sidebar, dropping the unit's space.
+fn format_resource_gb_short(bytes: u64) -> String {
+    let gb = bytes as f64 / BYTES_PER_GB;
+    if gb >= 10.0 {
+        format!("{gb:.0}G")
+    } else {
+        format!("{gb:.1}G")
+    }
+}
+
+/// Theme color for a reading's pressure band.
+///
+/// Normal readings borrow the same muted color as the sidebar's other
+/// secondary text, so the footer reads as background information until
+/// something is actually wrong.
+fn resource_pressure_style(pressure: ResourcePressure, p: &Palette) -> Style {
+    match pressure {
+        ResourcePressure::Normal => Style::default().fg(p.overlay1),
+        ResourcePressure::Warning => Style::default().fg(p.yellow),
+        ResourcePressure::HighWarning => Style::default().fg(p.peach),
+        ResourcePressure::Critical => Style::default().fg(p.red).add_modifier(Modifier::BOLD),
+    }
+}
+
+/// One footer line: a padded label followed by its reading.
+///
+/// The reading is truncated to `max_width` so a sidebar narrowed past the
+/// abbreviated form clips the number instead of spilling into the separator.
+fn resource_line(
+    label: &str,
+    value: &str,
+    label_column: usize,
+    max_width: usize,
+    label_style: Style,
+    value_style: Style,
+) -> Line<'static> {
+    let prefix = format!(" {label}");
+    let pad = " ".repeat(label_column.saturating_sub(label.len()));
+    let used = display_width(&prefix).saturating_add(pad.len());
+    let value = truncate_end(value, max_width.saturating_sub(used));
+    Line::from(vec![
+        Span::styled(prefix, label_style),
+        Span::styled(pad, label_style),
+        Span::styled(value, value_style),
+    ])
+}
+
+/// Draws the host resource readout pinned below the Agents list.
+///
+/// Values are read from state sampled elsewhere, so this stays a pure draw.
+fn render_sidebar_resources(app: &AppState, frame: &mut Frame, area: Rect) {
+    if area == Rect::default() || area.height < SIDEBAR_FOOTER_ROWS {
+        return;
+    }
+
+    let p = &app.palette;
+    frame.render_widget(
+        Paragraph::new(Span::styled(
+            "─".repeat(area.width as usize),
+            Style::default().fg(p.surface_dim),
+        )),
+        Rect::new(area.x, area.y, area.width, 1),
+    );
+
+    let label_style = Style::default().fg(p.overlay1);
+    // The bottom row yields a column to the collapse toggle, so the narrowest
+    // row decides the form. Measuring the full width instead would print the
+    // roomy form on one line and truncate it on the other.
+    // The layout reserves rows only above FOOTER_MIN_WIDTH, so this width is
+    // already known to fit the abbreviated form.
+    let text_width = area.width.saturating_sub(1);
+    let wide = text_width >= FOOTER_WIDE_MIN_WIDTH;
+    let (format, label_column): (fn(u64) -> String, usize) = if wide {
+        (format_resource_gb, FOOTER_LABEL_COLUMN)
+    } else {
+        (format_resource_gb_short, FOOTER_LABEL_COLUMN_NARROW)
+    };
+
+    for (row, (label, reading)) in [
+        ("SSD", app.system_resources.disk_available),
+        ("SWAP", app.system_resources.swap_used),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let Some(reading) = reading else {
+            continue;
+        };
+        let row_y = area.y + 1 + row as u16;
+        // The sidebar's collapse toggle owns the right edge of the bottom row,
+        // so that row stops one column short of it.
+        let on_toggle_row = row_y + 1 == area.y + area.height;
+        let row_width = area.width.saturating_sub(u16::from(on_toggle_row));
+        if row_width == 0 {
+            continue;
+        }
+        let line = resource_line(
+            label,
+            &format(reading.bytes),
+            label_column,
+            row_width as usize,
+            label_style,
+            resource_pressure_style(reading.pressure, p),
+        );
+        frame.render_widget(Paragraph::new(line), Rect::new(area.x, row_y, row_width, 1));
+    }
 }
 
 fn resolved_token_spans(
@@ -1233,7 +1449,7 @@ fn render_workspace_list(
         frame.render_widget(
             Paragraph::new(Line::from(vec![Span::styled(
                 " spaces",
-                Style::default().fg(p.overlay0).add_modifier(Modifier::BOLD),
+                Style::default().fg(p.overlay1).add_modifier(Modifier::BOLD),
             )])),
             Rect::new(area.x, area.y, area.width, 1),
         );
@@ -1406,7 +1622,7 @@ fn render_workspace_list(
     if app.mouse_capture && list_bottom > area.y {
         let new_rect = app.sidebar_new_button_rect();
         frame.render_widget(
-            Paragraph::new(Span::styled(" new", Style::default().fg(p.overlay0))),
+            Paragraph::new(Span::styled(" new", Style::default().fg(p.overlay1))),
             new_rect,
         );
 
@@ -1417,10 +1633,10 @@ fn render_workspace_list(
                     "● ",
                     Style::default().fg(p.accent).add_modifier(Modifier::BOLD),
                 ),
-                Span::styled("menu", Style::default().fg(p.overlay0)),
+                Span::styled("menu", Style::default().fg(p.overlay1)),
             ])
         } else {
-            Line::from(vec![Span::styled("menu", Style::default().fg(p.overlay0))])
+            Line::from(vec![Span::styled("menu", Style::default().fg(p.overlay1))])
         };
         frame.render_widget(
             Paragraph::new(menu_line).alignment(Alignment::Right),
@@ -1450,7 +1666,7 @@ fn render_agent_detail(
     frame.render_widget(
         Paragraph::new(Line::from(vec![Span::styled(
             " agents",
-            Style::default().fg(p.overlay0).add_modifier(Modifier::BOLD),
+            Style::default().fg(p.overlay1).add_modifier(Modifier::BOLD),
         )])),
         Rect::new(area.x, area.y + 1, area.width, 1),
     );
@@ -1461,7 +1677,7 @@ fn render_agent_detail(
         let color = if app.agent_view_override.is_some() {
             p.accent
         } else {
-            p.overlay0
+            p.overlay1
         };
         frame.render_widget(
             Paragraph::new(Span::styled(
@@ -1493,7 +1709,7 @@ fn render_agent_detail(
     let mut row_y = body.y;
     let body_bottom = body.y + body.height;
     for (index, detail) in details.iter().enumerate().skip(scroll) {
-        let label_color = state_label_color(detail.state, detail.seen, p);
+        let label_color = pane_state_label_color(detail.state, detail.seen, detail.errored, p);
         let rows = resolved_agent_rows(app, detail);
         let height = (rows.len().max(1) as u16).min(body.height);
         if row_y.saturating_add(height) > body_bottom {
@@ -1511,13 +1727,20 @@ fn render_agent_detail(
         } else {
             Style::default().fg(p.subtext0).add_modifier(Modifier::BOLD)
         };
-        let status_style = if is_active {
-            Style::default().fg(label_color)
-        } else {
-            Style::default().fg(label_color).add_modifier(Modifier::DIM)
-        };
-        let agent_style = Style::default().fg(p.overlay0).add_modifier(Modifier::DIM);
-        let state_icon = state_icon(detail.state, detail.seen, app.status_indicators, p);
+        // The state keeps its own color at full strength. Dimming inactive
+        // rows kept the project name leading but cost too much contrast on the
+        // one word that says what the agent is doing.
+        let status_style = Style::default().fg(label_color);
+        // Brighter than the section headings and no longer dimmed: the agent
+        // name is content, not chrome, and was the hardest row to read.
+        let agent_style = Style::default().fg(p.subtext0);
+        let state_icon = pane_state_icon(
+            detail.state,
+            detail.seen,
+            detail.errored,
+            app.status_indicators,
+            p,
+        );
 
         for (row_index, resolved) in rows.iter().take(height as usize).enumerate() {
             let mut spans = vec![Span::raw(if row_index == 0 { " " } else { "   " })];
@@ -1651,7 +1874,7 @@ mod tests {
     }
 
     #[test]
-    fn default_agent_rows_remove_redundant_state_text() {
+    fn default_agent_rows_pair_the_agent_with_its_state() {
         let mut app = crate::app::state::AppState::test_new();
         let workspace = Workspace::test_new("one");
         let pane_id = workspace.tabs[0].root_pane;
@@ -1671,14 +1894,18 @@ mod tests {
             .draw(|frame| render_sidebar(&app, &TerminalRuntimeRegistry::new(), frame, area))
             .unwrap();
         let buffer = terminal.backend().buffer();
-        let (_, agent_area) = expanded_sidebar_sections(area, app.sidebar_section_split);
+        let (_, agent_area) =
+            expanded_sidebar_sections(area, app.sidebar_section_split, sidebar_footer_rows(&app));
         let body = agent_panel_body_rect(agent_area, false);
 
         let first = row_text(buffer, body.y, 25);
         let second = row_text(buffer, body.y + 1, 25);
+        // The project leads its own row; the agent and its state share the next
+        // one, so a narrow sidebar never has to squeeze them together.
         assert!(first.contains("one"));
-        assert_eq!(second, "   pi");
-        assert!(!first.contains("working"));
+        assert!(!first.contains("running"));
+        assert_eq!(second, "   pi · running");
+        // Herdr detects this as `Working`; the sidebar names it for the user.
         assert!(!second.contains("working"));
 
         let workspace_x = find_symbol_x(buffer, body.y, body.width, "o");
@@ -1690,14 +1917,15 @@ mod tests {
 
         let agent_x = find_symbol_x(buffer, body.y + 1, body.width, "p");
         let agent_style = buffer[(agent_x, body.y + 1)].style();
-        assert_eq!(agent_style.fg, Some(app.palette.overlay0));
-        assert!(agent_style.add_modifier.contains(Modifier::DIM));
+        // Content, not chrome: brighter than the headings and undimmed.
+        assert_eq!(agent_style.fg, Some(app.palette.subtext0));
+        assert!(!agent_style.add_modifier.contains(Modifier::DIM));
         assert!(!agent_style.add_modifier.contains(Modifier::BOLD));
         assert_eq!(agent_style.bg, Some(app.palette.active_row_bg));
     }
 
     #[test]
-    fn occurrence_false_removes_default_workspace_bold_and_agent_dim() {
+    fn occurrence_false_removes_default_workspace_bold() {
         let config: crate::config::Config = toml::from_str(
             r##"
 [ui.sidebar.agents]
@@ -1722,7 +1950,8 @@ rows = [[{ token = "workspace", bold = false }, { token = "agent", dim = false }
         terminal
             .draw(|frame| render_sidebar(&app, &TerminalRuntimeRegistry::new(), frame, area))
             .unwrap();
-        let (_, agent_area) = expanded_sidebar_sections(area, app.sidebar_section_split);
+        let (_, agent_area) =
+            expanded_sidebar_sections(area, app.sidebar_section_split, sidebar_footer_rows(&app));
         let body = agent_panel_body_rect(agent_area, false);
         let buffer = terminal.backend().buffer();
         let workspace = buffer[(find_symbol_x(buffer, body.y, body.width, "o"), body.y)].style();
@@ -1730,7 +1959,7 @@ rows = [[{ token = "workspace", bold = false }, { token = "agent", dim = false }
 
         assert_eq!(workspace.fg, Some(app.palette.text));
         assert!(!workspace.add_modifier.contains(Modifier::BOLD));
-        assert_eq!(agent.fg, Some(app.palette.overlay0));
+        assert_eq!(agent.fg, Some(app.palette.subtext0));
         assert!(!agent.add_modifier.contains(Modifier::DIM));
     }
 
@@ -2013,7 +2242,8 @@ rows = [[{ token = "git_status", fg = "#123456" }]]
             .draw(|frame| render_sidebar(&app, &TerminalRuntimeRegistry::new(), frame, area))
             .unwrap();
         let buffer = terminal.backend().buffer();
-        let (_, agent_area) = expanded_sidebar_sections(area, app.sidebar_section_split);
+        let (_, agent_area) =
+            expanded_sidebar_sections(area, app.sidebar_section_split, sidebar_footer_rows(&app));
         let body = agent_panel_body_rect(agent_area, false);
         let first = row_text(buffer, body.y, 17);
 
@@ -2043,7 +2273,8 @@ rows = [[{ token = "git_status", fg = "#123456" }]]
         renderer
             .draw(|frame| render_sidebar(&app, &TerminalRuntimeRegistry::new(), frame, area))
             .unwrap();
-        let (_, agent_area) = expanded_sidebar_sections(area, app.sidebar_section_split);
+        let (_, agent_area) =
+            expanded_sidebar_sections(area, app.sidebar_section_split, sidebar_footer_rows(&app));
         let body = agent_panel_body_rect(agent_area, false);
         let rendered = row_text(renderer.backend().buffer(), body.y, 9);
 
@@ -2119,7 +2350,8 @@ rows = [[{ token = "git_status", fg = "#123456" }]]
         app.workspaces = vec![Workspace::test_new("one"), Workspace::test_new("two")];
         app.sidebar_spaces.rows = vec![vec![crate::config::SpaceSidebarToken::Workspace]; 6];
         let area = Rect::new(0, 0, 20, 10);
-        let workspace_area = workspace_list_rect(area, app.sidebar_section_split);
+        let workspace_area =
+            workspace_list_rect(area, app.sidebar_section_split, sidebar_footer_rows(&app));
         let body = workspace_list_body_rect(workspace_area, false);
 
         let metrics = workspace_list_scroll_metrics(&app, workspace_area);
@@ -2632,7 +2864,7 @@ rows = [[{ token = "git_status", fg = "#123456" }]]
 
     #[test]
     fn expanded_sidebar_sections_handle_tiny_heights() {
-        let (ws_area, detail_area) = expanded_sidebar_sections(Rect::new(0, 0, 20, 5), 0.9);
+        let (ws_area, detail_area) = expanded_sidebar_sections(Rect::new(0, 0, 20, 5), 0.9, 0);
 
         assert_eq!(ws_area, Rect::new(0, 0, 19, 3));
         assert_eq!(detail_area, Rect::new(0, 3, 19, 2));
@@ -2640,7 +2872,7 @@ rows = [[{ token = "git_status", fg = "#123456" }]]
 
     #[test]
     fn sidebar_section_divider_is_hidden_for_tiny_heights() {
-        let divider = sidebar_section_divider_rect(Rect::new(0, 0, 20, 5), 0.5);
+        let divider = sidebar_section_divider_rect(Rect::new(0, 0, 20, 5), 0.5, 0);
 
         assert_eq!(divider, Rect::default());
     }
@@ -2732,7 +2964,8 @@ rows = [[{ token = "git_status", fg = "#123456" }]]
         app.sidebar_spaces.row_gap = 0;
         let area = Rect::new(0, 0, 30, 20);
         app.view.workspace_card_areas = compute_workspace_card_areas(&app, area);
-        let list_area = workspace_list_rect(area, app.sidebar_section_split);
+        let list_area =
+            workspace_list_rect(area, app.sidebar_section_split, sidebar_footer_rows(&app));
 
         let mut terminal = Terminal::new(TestBackend::new(area.width, area.height)).unwrap();
         terminal
@@ -2773,7 +3006,8 @@ rows = [[{ token = "git_status", fg = "#123456" }]]
         let area = Rect::new(0, 0, 30, 10);
         app.view.workspace_card_areas = compute_workspace_card_areas(&app, area);
         assert_eq!(app.view.workspace_card_areas.len(), 2);
-        let list_area = workspace_list_rect(area, app.sidebar_section_split);
+        let list_area =
+            workspace_list_rect(area, app.sidebar_section_split, sidebar_footer_rows(&app));
 
         let mut terminal = Terminal::new(TestBackend::new(area.width, area.height)).unwrap();
         terminal
@@ -2865,7 +3099,8 @@ rows = [[{ token = "git_status", fg = "#123456" }]]
         app.sidebar_spaces.row_gap = 0;
         let area = Rect::new(0, 0, 30, 20);
         app.view.workspace_card_areas = compute_workspace_card_areas(&app, area);
-        let list_area = workspace_list_rect(area, app.sidebar_section_split);
+        let list_area =
+            workspace_list_rect(area, app.sidebar_section_split, sidebar_footer_rows(&app));
         let indicator_row = workspace_drop_indicator_row(
             &app,
             &app.view.workspace_card_areas,
@@ -3174,5 +3409,308 @@ rows = [[{ token = "git_status", fg = "#123456" }]]
                 },
             ]
         );
+    }
+
+    fn app_with_readings(disk_bytes: u64, swap_bytes: u64) -> crate::app::state::AppState {
+        use crate::app::system_resources::{ResourceReading, SystemResources};
+
+        let mut app = crate::app::state::AppState::test_new();
+        let workspace = Workspace::test_new("one");
+        app.workspaces = vec![workspace];
+        app.ensure_test_terminals();
+        app.active = Some(0);
+        app.system_resources = SystemResources {
+            disk_available: Some(ResourceReading {
+                bytes: disk_bytes,
+                pressure: crate::app::system_resources::ResourcePressure::Normal,
+            }),
+            swap_used: Some(ResourceReading {
+                bytes: swap_bytes,
+                pressure: crate::app::system_resources::ResourcePressure::Normal,
+            }),
+        };
+        app
+    }
+
+    fn render_sidebar_to_buffer(
+        app: &crate::app::state::AppState,
+        area: Rect,
+    ) -> ratatui::buffer::Buffer {
+        let mut terminal = Terminal::new(TestBackend::new(area.width, area.height)).unwrap();
+        terminal
+            .draw(|frame| render_sidebar(app, &TerminalRuntimeRegistry::new(), frame, area))
+            .unwrap();
+        terminal.backend().buffer().clone()
+    }
+
+    #[test]
+    fn resource_footer_is_pinned_to_the_bottom_below_the_agents_list() {
+        let app = app_with_readings(197_895_245_824, 0);
+        let area = Rect::new(0, 0, 26, 20);
+
+        let buffer = render_sidebar_to_buffer(&app, area);
+
+        // Last two rows of the sidebar, every time, regardless of agent count.
+        assert_eq!(row_text(&buffer, 18, 25), " SSD   198 GB");
+        assert_eq!(row_text(&buffer, 19, 24), " SWAP  0.0 GB");
+        // The collapse toggle keeps its corner instead of being overdrawn.
+        let toggle = expanded_sidebar_toggle_rect(area);
+        assert_eq!(toggle.y, 19);
+        assert_eq!(buffer[(toggle.x, toggle.y)].symbol(), "«");
+
+        // The two sections together give up exactly the footer's rows, keeping
+        // their configured proportion, and the Agents list ends where the
+        // footer begins — so it scrolls within what is left rather than running
+        // underneath the readings.
+        let footer_rows = sidebar_footer_rows(&app);
+        assert_eq!(footer_rows, 3);
+        let (ws_area, agent_area) =
+            expanded_sidebar_sections(area, app.sidebar_section_split, footer_rows);
+        let (unfooted_ws, unfooted_agents) =
+            expanded_sidebar_sections(area, app.sidebar_section_split, 0);
+        assert_eq!(
+            ws_area.height + agent_area.height + footer_rows,
+            unfooted_ws.height + unfooted_agents.height
+        );
+        assert!(agent_area.height < unfooted_agents.height);
+
+        let footer = sidebar_footer_rect(area, footer_rows);
+        assert_eq!(ws_area.y + ws_area.height, agent_area.y);
+        assert_eq!(agent_area.y + agent_area.height, footer.y);
+        assert_eq!(footer.y + footer.height, area.y + area.height);
+        // Scroll geometry is derived from the shortened section, so the list
+        // stops above the footer instead of drawing into it.
+        assert!(agent_panel_body_rect(agent_area, false).bottom() <= footer.y);
+    }
+
+    #[test]
+    fn narrow_sidebar_abbreviates_the_readings_instead_of_truncating_them() {
+        let app = app_with_readings(197_895_245_824, 0);
+
+        // The abbreviated form pulls the label column in by one, which is what
+        // keeps the bottom row — a column short because of the collapse
+        // toggle — from having to cut the number.
+        for width in [12, 13, 14] {
+            let area = Rect::new(0, 0, width, 20);
+            let buffer = render_sidebar_to_buffer(&app, area);
+            let text_width = area.width.saturating_sub(1);
+
+            assert_eq!(
+                row_text(&buffer, 18, text_width),
+                " SSD  198G",
+                "width {width}"
+            );
+            assert_eq!(
+                row_text(&buffer, 19, text_width.saturating_sub(1)),
+                " SWAP 0.0G",
+                "width {width}"
+            );
+
+            let toggle = expanded_sidebar_toggle_rect(area);
+            assert_eq!(buffer[(toggle.x, toggle.y)].symbol(), "«");
+        }
+
+        // From here both rows fit the roomy form.
+        for width in [15, 26] {
+            let area = Rect::new(0, 0, width, 20);
+            let buffer = render_sidebar_to_buffer(&app, area);
+            let text_width = area.width.saturating_sub(1);
+
+            assert_eq!(
+                row_text(&buffer, 18, text_width),
+                " SSD   198 GB",
+                "width {width}"
+            );
+            assert_eq!(
+                row_text(&buffer, 19, text_width.saturating_sub(1)),
+                " SWAP  0.0 GB",
+                "width {width}"
+            );
+        }
+    }
+
+    #[test]
+    fn no_sidebar_width_truncates_a_reading_or_overruns_the_separator() {
+        let app = app_with_readings(197_895_245_824, 3_200_000_000);
+
+        for width in 4..=40u16 {
+            let area = Rect::new(0, 0, width, 20);
+            let buffer = render_sidebar_to_buffer(&app, area);
+            let footer = sidebar_footer_rect(area, sidebar_footer_rows(&app));
+
+            if footer == Rect::default() {
+                // Too narrow to render honestly, so nothing is drawn.
+                continue;
+            }
+
+            for row in [footer.y + 1, footer.y + 2] {
+                let text = row_text(&buffer, row, area.width);
+                assert!(!text.contains('…'), "width {width} truncated: {text:?}");
+                // The separator column stays the separator's.
+                assert_eq!(
+                    buffer[(area.width - 1, row)].symbol(),
+                    "│",
+                    "width {width} overran the separator"
+                );
+            }
+
+            // The toggle keeps its cell on the bottom row.
+            let toggle = expanded_sidebar_toggle_rect(area);
+            assert_eq!(
+                buffer[(toggle.x, toggle.y)].symbol(),
+                "«",
+                "width {width} overdrew the toggle"
+            );
+        }
+    }
+
+    #[test]
+    fn short_sidebar_keeps_its_sections_rather_than_showing_a_partial_footer() {
+        // Six rows is the sections' own floor, so nothing is left to reserve.
+        let tall = |h| Rect::new(0, 0, 26, h);
+        assert_eq!(fitted_footer_rows(tall(8), 3), 0);
+        assert_eq!(fitted_footer_rows(tall(9), 3), 3);
+        assert_eq!(fitted_footer_rows(tall(20), 0), 0);
+        // Too narrow for the abbreviated form: the rows go back as well.
+        assert_eq!(fitted_footer_rows(Rect::new(0, 0, 11, 20), 3), 3);
+        assert_eq!(fitted_footer_rows(Rect::new(0, 0, 10, 20), 3), 0);
+
+        let app = app_with_readings(197_895_245_824, 0);
+        let area = Rect::new(0, 0, 26, 8);
+
+        assert_eq!(
+            sidebar_footer_rect(area, sidebar_footer_rows(&app)),
+            Rect::default()
+        );
+        let (_, agent_area) = expanded_sidebar_sections(area, app.sidebar_section_split, 3);
+        let (_, unfooted) = expanded_sidebar_sections(area, app.sidebar_section_split, 0);
+        assert_eq!(agent_area, unfooted);
+    }
+
+    #[test]
+    fn footer_disappears_when_disabled_or_unreported() {
+        let mut app = app_with_readings(197_895_245_824, 0);
+        app.sidebar_resources.enabled = false;
+        assert_eq!(sidebar_footer_rows(&app), 0);
+
+        app.sidebar_resources.enabled = true;
+        app.system_resources = crate::app::system_resources::SystemResources::default();
+        assert_eq!(sidebar_footer_rows(&app), 0);
+
+        let area = Rect::new(0, 0, 26, 20);
+        let buffer = render_sidebar_to_buffer(&app, area);
+        assert!(!row_text(&buffer, 18, 25).contains("SSD"));
+        assert!(!row_text(&buffer, 19, 25).contains("SWAP"));
+    }
+
+    #[test]
+    fn only_low_space_raises_the_footer_voice() {
+        use crate::app::system_resources::ResourcePressure;
+
+        let palette = crate::app::state::Palette::catppuccin();
+
+        // Muted, but readable without squinting: a healthy reading should not
+        // be the dimmest thing in the sidebar.
+        let normal = resource_pressure_style(ResourcePressure::Normal, &palette);
+        assert_eq!(normal.fg, Some(palette.overlay1));
+        assert!(!normal.add_modifier.contains(Modifier::DIM));
+
+        assert_eq!(
+            resource_pressure_style(ResourcePressure::Warning, &palette).fg,
+            Some(palette.yellow)
+        );
+        assert_eq!(
+            resource_pressure_style(ResourcePressure::HighWarning, &palette).fg,
+            Some(palette.peach)
+        );
+
+        let critical = resource_pressure_style(ResourcePressure::Critical, &palette);
+        assert_eq!(critical.fg, Some(palette.red));
+        assert!(critical.add_modifier.contains(Modifier::BOLD));
+        assert!(!critical.add_modifier.contains(Modifier::DIM));
+    }
+
+    #[test]
+    fn readings_keep_a_tenth_of_a_gigabyte_only_where_it_matters() {
+        assert_eq!(format_resource_gb(197_895_245_824), "198 GB");
+        assert_eq!(format_resource_gb(0), "0.0 GB");
+        assert_eq!(format_resource_gb(8_400_000_000), "8.4 GB");
+        assert_eq!(format_resource_gb(19_000_000_000), "19 GB");
+        assert_eq!(format_resource_gb_short(197_895_245_824), "198G");
+        assert_eq!(format_resource_gb_short(0), "0.0G");
+    }
+
+    #[test]
+    fn an_agent_that_died_mid_turn_reads_as_error_and_keeps_its_row() {
+        let mut entry = AgentPanelEntry {
+            ws_idx: 0,
+            tab_idx: 0,
+            pane_id: PaneId::from_raw(1),
+            primary_label: "CoreBeasts".into(),
+            primary_tab_label: None,
+            pane_label: None,
+            terminal_title: None,
+            terminal_title_stripped: None,
+            agent_label: Some("claude".into()),
+            agent_kind_label: Some("claude".into()),
+            agent: Some(Agent::Claude),
+            state: AgentState::Working,
+            seen: true,
+            errored: true,
+            last_agent_state_change_seq: None,
+            state_labels: std::collections::HashMap::new(),
+            tokens: std::collections::HashMap::new(),
+        };
+        let app = crate::app::state::AppState::test_new();
+
+        // The recorded process exit outranks whatever detection last saw.
+        let rows = resolved_agent_rows(&app, &entry);
+        assert_eq!(
+            rows[1],
+            vec![
+                ResolvedToken::unstyled(ResolvedTokenKind::Agent("claude".into())),
+                ResolvedToken::unstyled(ResolvedTokenKind::StateText("error".into())),
+            ]
+        );
+
+        // A reported override still wins, as it does for every other status.
+        entry.state_labels.insert("error".into(), "crashed".into());
+        let overridden = resolved_agent_rows(&app, &entry);
+        assert_eq!(
+            overridden[1][1],
+            ResolvedToken::unstyled(ResolvedTokenKind::StateText("crashed".into()))
+        );
+
+        // Clearing the flag returns the row to the detected state.
+        entry.errored = false;
+        let recovered = resolved_agent_rows(&app, &entry);
+        assert_eq!(
+            recovered[1][1],
+            ResolvedToken::unstyled(ResolvedTokenKind::StateText("running".into()))
+        );
+    }
+
+    #[test]
+    fn a_working_agent_reads_as_running_in_the_default_rows() {
+        let mut app = crate::app::state::AppState::test_new();
+        let workspace = Workspace::test_new("one");
+        let pane_id = workspace.tabs[0].root_pane;
+        app.workspaces = vec![workspace];
+        app.ensure_test_terminals();
+        app.active = Some(0);
+        let terminal_id = app.workspaces[0].tabs[0].panes[&pane_id]
+            .attached_terminal_id
+            .clone();
+        let terminal_state = app.terminals.get_mut(&terminal_id).unwrap();
+        terminal_state.detected_agent = Some(Agent::Pi);
+        terminal_state.state = AgentState::Working;
+
+        let area = Rect::new(0, 0, 26, 20);
+        let buffer = render_sidebar_to_buffer(&app, area);
+        let (_, agent_area) =
+            expanded_sidebar_sections(area, app.sidebar_section_split, sidebar_footer_rows(&app));
+        let body = agent_panel_body_rect(agent_area, false);
+
+        assert_eq!(row_text(&buffer, body.y + 1, 25), "   pi · running");
     }
 }

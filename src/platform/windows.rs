@@ -78,7 +78,7 @@ use windows_sys::{
     },
 };
 
-use super::{ClipboardImage, ForegroundJob, Signal};
+use super::{ClipboardImage, ForegroundJob, Signal, SystemResourceSample};
 
 const STILL_ACTIVE: u32 = 259;
 const FOREGROUND_PROCESS_SNAPSHOT_CACHE_TTL: Duration = Duration::from_millis(250);
@@ -2505,6 +2505,12 @@ impl Drop for InputSourceRestore {
             }
         }
     }
+}
+
+/// Windows has no equivalent sidebar resource readout yet, so both readings
+/// stay absent and the footer hides itself instead of showing a fake zero.
+pub fn system_resource_sample() -> SystemResourceSample {
+    SystemResourceSample::default()
 }
 
 #[cfg(test)]

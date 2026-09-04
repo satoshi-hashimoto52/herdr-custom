@@ -4816,6 +4816,9 @@ impl HeadlessServer {
         }
 
         changed |= self.app.handle_tab_bar_status_tasks(now);
+        if self.has_app_client() {
+            changed |= self.app.handle_system_resource_refresh(now);
+        }
 
         if geometry_dirty {
             self.app.pending_agent_resume_deadline = None;
@@ -7007,6 +7010,41 @@ next_tab = ""
             ),
             None
         );
+    }
+
+    #[test]
+    fn headless_server_samples_host_resources_for_the_sidebar_footer() {
+        let mut server = test_headless_server();
+        let (writer, _control_rx, _render_rx) = test_client_writer();
+
+        // Without a client nobody is looking at the sidebar, so nothing is read.
+        assert!(!server.has_app_client());
+        server.handle_scheduled_tasks_headless(Instant::now(), false);
+        assert!(server.app.state.system_resources.is_empty());
+
+        assert!(server.handle_server_event(ServerEvent::ClientConnected {
+            client_id: 11,
+            cols: 120,
+            rows: 40,
+            cell_width_px: 0,
+            cell_height_px: 0,
+            render_encoding: RenderEncoding::SemanticFrame,
+            keybindings: None,
+            direct_attach_requested: false,
+            direct_graphics: false,
+            writer,
+        }));
+        assert!(server.has_app_client());
+
+        // The server owns app state, so the reading has to be taken on its own
+        // scheduled-task path; the monolithic one never runs here.
+        server.handle_scheduled_tasks_headless(Instant::now(), false);
+
+        assert!(
+            !server.app.state.system_resources.is_empty(),
+            "the sidebar footer has no reading to draw"
+        );
+        assert!(crate::ui::sidebar_footer_rows(&server.app.state) > 0);
     }
 
     #[test]

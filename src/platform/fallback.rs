@@ -1,7 +1,7 @@
 use std::path::PathBuf;
 use std::process::Command;
 
-use super::{ClipboardImage, ForegroundJob, Signal};
+use super::{ClipboardImage, ForegroundJob, Signal, SystemResourceSample};
 
 pub(crate) fn remote_ssh_config_paths() -> super::RemoteSshConfigPaths {
     super::RemoteSshConfigPaths {
@@ -219,4 +219,9 @@ pub fn read_clipboard_image() -> Option<ClipboardImage> {
 /// Unsupported platform stub.
 pub fn show_desktop_notification(_title: &str, _body: Option<&str>) -> std::io::Result<bool> {
     Ok(false)
+}
+
+/// Unsupported platforms report no readings so the sidebar footer stays hidden.
+pub fn system_resource_sample() -> SystemResourceSample {
+    SystemResourceSample::default()
 }

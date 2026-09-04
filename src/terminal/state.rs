@@ -110,6 +110,12 @@ struct AgentNameOwner {
 struct RecentAgentProcessExit {
     agent: Agent,
     observed_at: Instant,
+    /// State the agent held as its process went away.
+    ///
+    /// An agent that exits from `Idle` was quit deliberately. One that exits
+    /// mid-turn, while `Working` or `Blocked`, died with work outstanding,
+    /// which is the evidence behind the sidebar's `error` label.
+    state_before_exit: AgentState,
 }
 
 /// Pure state for a server-owned terminal.
@@ -252,6 +258,29 @@ impl TerminalState {
     pub(crate) fn agent_process_exited_within(&self, now: Instant, max_age: Duration) -> bool {
         self.recent_agent_process_exit
             .is_some_and(|exit| now.saturating_duration_since(exit.observed_at) <= max_age)
+    }
+
+    /// The agent whose process died with a turn still outstanding.
+    ///
+    /// This is a recorded process exit, not a guess from screen text, so the
+    /// sidebar can label it `error` without grepping pane output. Detecting a
+    /// replacement process clears the record, so restarting the agent clears
+    /// the label.
+    ///
+    /// Returning the agent, rather than a bare flag, lets the Agents list keep
+    /// the row: process exit otherwise releases the agent identity and the pane
+    /// would drop out of the list, hiding the failure instead of reporting it.
+    /// An agent that exits from `Idle` was quit deliberately and keeps the
+    /// existing behavior of leaving the list.
+    pub(crate) fn agent_exited_mid_turn(&self) -> Option<Agent> {
+        self.recent_agent_process_exit
+            .filter(|exit| {
+                matches!(
+                    exit.state_before_exit,
+                    AgentState::Working | AgentState::Blocked
+                )
+            })
+            .map(|exit| exit.agent)
     }
 
     pub fn with_pending_agent_resume_plan(
@@ -401,6 +430,7 @@ impl TerminalState {
                 self.recent_agent_process_exit = Some(RecentAgentProcessExit {
                     agent,
                     observed_at: now,
+                    state_before_exit: previous_state,
                 });
             }
         } else if agent.is_some() {
@@ -5677,6 +5707,115 @@ mod tests {
         assert!(terminal.persisted_agent_session.is_none());
         assert!(!terminal.respawn_shell_on_exit);
         assert!(!terminal.finish_agent_process_acquisition());
+    }
+
+    #[test]
+    fn mid_turn_process_exit_is_an_error_but_a_deliberate_quit_is_not() {
+        let now = std::time::Instant::now();
+
+        // Working when the process went away: the turn never finished.
+        let mut interrupted = test_terminal();
+        interrupted.set_detected_state_with_screen_signals_at(
+            Some(Agent::Claude),
+            AgentState::Working,
+            false,
+            false,
+            true,
+            false,
+            now,
+        );
+        interrupted.set_detected_state_with_screen_signals_at(
+            Some(Agent::Claude),
+            AgentState::Idle,
+            false,
+            true,
+            false,
+            true,
+            now + Duration::from_millis(10),
+        );
+        assert_eq!(interrupted.agent_exited_mid_turn(), Some(Agent::Claude));
+
+        // Blocked when the process went away: still an unfinished request.
+        let mut abandoned = test_terminal();
+        abandoned.set_detected_state_with_screen_signals_at(
+            Some(Agent::Claude),
+            AgentState::Blocked,
+            true,
+            false,
+            false,
+            false,
+            now,
+        );
+        abandoned.set_detected_state_with_screen_signals_at(
+            Some(Agent::Claude),
+            AgentState::Idle,
+            false,
+            true,
+            false,
+            true,
+            now + Duration::from_millis(10),
+        );
+        assert_eq!(abandoned.agent_exited_mid_turn(), Some(Agent::Claude));
+
+        // Quit from the prompt: normal, and not reported as an error.
+        let mut quit = test_terminal();
+        quit.set_detected_state_with_screen_signals_at(
+            Some(Agent::Claude),
+            AgentState::Idle,
+            false,
+            true,
+            false,
+            false,
+            now,
+        );
+        quit.set_detected_state_with_screen_signals_at(
+            Some(Agent::Claude),
+            AgentState::Idle,
+            false,
+            true,
+            false,
+            true,
+            now + Duration::from_millis(10),
+        );
+        assert_eq!(quit.agent_exited_mid_turn(), None);
+    }
+
+    #[test]
+    fn a_replacement_agent_process_clears_the_error() {
+        let now = std::time::Instant::now();
+        let mut terminal = test_terminal();
+
+        terminal.set_detected_state_with_screen_signals_at(
+            Some(Agent::Claude),
+            AgentState::Working,
+            false,
+            false,
+            true,
+            false,
+            now,
+        );
+        terminal.set_detected_state_with_screen_signals_at(
+            Some(Agent::Claude),
+            AgentState::Idle,
+            false,
+            true,
+            false,
+            true,
+            now + Duration::from_millis(10),
+        );
+        assert_eq!(terminal.agent_exited_mid_turn(), Some(Agent::Claude));
+
+        // Restarting the agent in the same pane clears the label.
+        terminal.set_detected_state_with_screen_signals_at(
+            Some(Agent::Claude),
+            AgentState::Idle,
+            false,
+            true,
+            false,
+            false,
+            now + Duration::from_secs(1),
+        );
+        assert_eq!(terminal.agent_exited_mid_turn(), None);
     }
 
     #[test]

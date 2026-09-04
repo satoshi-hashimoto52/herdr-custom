@@ -10,7 +10,11 @@ impl AppState {
         if self.sidebar_collapsed || sidebar.width <= 1 || sidebar.height == 0 {
             return Rect::default();
         }
-        crate::ui::workspace_list_rect(sidebar, self.sidebar_section_split)
+        crate::ui::workspace_list_rect(
+            sidebar,
+            self.sidebar_section_split,
+            crate::ui::sidebar_footer_rows(self),
+        )
     }
 
     pub(super) fn agent_panel_rect(&self) -> Rect {
@@ -18,8 +22,11 @@ impl AppState {
         if self.sidebar_collapsed || sidebar.width <= 1 || sidebar.height == 0 {
             return Rect::default();
         }
-        let (_, detail_area) =
-            crate::ui::expanded_sidebar_sections(sidebar, self.sidebar_section_split);
+        let (_, detail_area) = crate::ui::expanded_sidebar_sections(
+            sidebar,
+            self.sidebar_section_split,
+            crate::ui::sidebar_footer_rows(self),
+        );
         detail_area
     }
 
@@ -279,6 +286,7 @@ impl AppState {
         let rect = crate::ui::sidebar_section_divider_rect(
             self.view.sidebar_rect,
             self.sidebar_section_split,
+            crate::ui::sidebar_footer_rows(self),
         );
         rect.width > 0
             && col >= rect.x
@@ -473,6 +481,7 @@ impl AppState {
         let (_, detail_area) = crate::ui::expanded_sidebar_sections(
             self.view.sidebar_rect,
             self.sidebar_section_split,
+            crate::ui::sidebar_footer_rows(self),
         );
         let rect = crate::ui::agent_panel_toggle_rect(detail_area, self.agent_panel_sort);
         rect.width > 0
@@ -855,6 +864,7 @@ mod tests {
         let (_, detail_area) = crate::ui::expanded_sidebar_sections(
             app.state.view.sidebar_rect,
             app.state.sidebar_section_split,
+            crate::ui::sidebar_footer_rows(&app.state),
         );
         let toggle = crate::ui::agent_panel_toggle_rect(detail_area, app.state.agent_panel_sort);
         app.handle_mouse(mouse(
@@ -901,6 +911,7 @@ mod tests {
         let (_, detail_area) = crate::ui::expanded_sidebar_sections(
             app.state.view.sidebar_rect,
             app.state.sidebar_section_split,
+            crate::ui::sidebar_footer_rows(&app.state),
         );
         app.handle_mouse(mouse(
             MouseEventKind::Down(MouseButton::Left),
@@ -1897,6 +1908,7 @@ mod tests {
         let divider = crate::ui::sidebar_section_divider_rect(
             app.state.view.sidebar_rect,
             app.state.sidebar_section_split,
+            crate::ui::sidebar_footer_rows(&app.state),
         );
 
         app.handle_mouse(mouse(

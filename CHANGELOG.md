@@ -2,6 +2,14 @@
 
 ## Unreleased
 
+### Added
+- The expanded sidebar now pins free disk space and swap use below the Agents list, so the Agents list scrolls while the readings stay visible. Values come from OS APIs rather than shelled-out commands — `statfs` on the APFS Data volume and `vm.swapusage` on macOS, `statvfs` and `/proc/meminfo` on Linux — and report the space a process can actually claim instead of the purgeable-inclusive figure Finder shows. Readings refresh every four seconds only while the footer is on screen, and mark yellow, peach, and red as space runs low or swap grows. Turn the footer off with `ui.sidebar.resources.enabled = false`.
+- Agent sidebar rows now carry their state by default, showing the project on the first row and `agent · state` on the second, so a narrow sidebar does not squeeze both into one line.
+- Agents whose process exits mid-turn now report `error`, based on the recorded process exit rather than pane output, and `error` is accepted as a `state_labels` key for per-pane overrides.
+
+### Changed
+- Sidebar agent states are now labelled for what the user is waiting on: detected `working` reads as `running`, and `blocked` reads as `waiting`. The socket API keeps its existing `idle`/`working`/`blocked`/`done`/`unknown` values.
+
 ## [0.8.2] - 2026-08-19
 
 ### Added

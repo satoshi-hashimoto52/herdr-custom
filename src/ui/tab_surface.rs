@@ -302,9 +302,12 @@ mod tests {
         assert!(!app.view.split_borders.is_empty());
         assert!(frame.cursor.is_some());
         assert_eq!(frame.hyperlinks, vec![uri.to_owned()]);
+        // Covers the whole desktop frame, so a deliberate sidebar restyle moves
+        // it. Last updated when the sidebar headings, agent names, and resource
+        // footer were brightened off the dimmest palette entries.
         assert_eq!(
             frame_digest(&frame),
-            "a7c21fa42305a41231c7ae254f264f6ef923f46301d8fc4cd35ab6dfdd651b6b"
+            "e9d60bfb0488df4efedcdb0daddaf82d395bd75c50fbda3c0172f6b80e5b270a"
         );
     }
 

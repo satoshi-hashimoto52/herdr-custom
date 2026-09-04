@@ -9,7 +9,7 @@ use std::{
 
 use super::{
     read_limited_reader, ClipboardCommand, ClipboardImage, ForegroundJob, ForegroundProcess,
-    LimitedRead, Signal,
+    LimitedRead, Signal, SystemResourceSample,
 };
 
 pub(crate) use super::unix_common::{
@@ -749,6 +749,44 @@ fn process_session_id(pid: u32) -> Option<i32> {
     fields.get(3)?.parse().ok()
 }
 
+/// Reads host disk and swap pressure through `statvfs` and `/proc/meminfo`.
+pub fn system_resource_sample() -> SystemResourceSample {
+    SystemResourceSample {
+        disk_available_bytes: available_disk_bytes(std::path::Path::new("/")),
+        swap_used_bytes: swap_used_bytes_from_meminfo(
+            &std::fs::read_to_string("/proc/meminfo").unwrap_or_default(),
+        ),
+    }
+}
+
+/// Space available to an unprivileged process, matching `df`.
+fn available_disk_bytes(path: &std::path::Path) -> Option<u64> {
+    let path = std::ffi::CString::new(path.as_os_str().as_bytes()).ok()?;
+    let mut stat = std::mem::MaybeUninit::<libc::statvfs>::uninit();
+    // SAFETY: `path` is a valid NUL-terminated C string and `stat` is a
+    // correctly sized, writable `statvfs` allocation the call fills in.
+    if unsafe { libc::statvfs(path.as_ptr(), stat.as_mut_ptr()) } != 0 {
+        return None;
+    }
+    // SAFETY: `statvfs` returned success, so the buffer is initialized.
+    let stat = unsafe { stat.assume_init() };
+    u64::from(stat.f_frsize).checked_mul(stat.f_bavail)
+}
+
+/// Swap in use, derived from `SwapTotal` minus `SwapFree`.
+fn swap_used_bytes_from_meminfo(meminfo: &str) -> Option<u64> {
+    let field = |key: &str| {
+        meminfo
+            .lines()
+            .find_map(|line| line.strip_prefix(key)?.trim().strip_suffix("kB"))
+            .and_then(|value| value.trim().parse::<u64>().ok())
+            .and_then(|kib| kib.checked_mul(1024))
+    };
+    let total = field("SwapTotal:")?;
+    let free = field("SwapFree:")?;
+    Some(total.saturating_sub(free))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1277,5 +1315,26 @@ mod tests {
         assert_eq!(argv[1], "-c");
         assert!(argv[2].contains("EDITOR:-vi"));
         assert!(argv[2].contains("/tmp/herdr scrollback.txt"));
+    }
+
+    #[test]
+    fn swap_used_is_total_minus_free_and_needs_both_fields() {
+        let meminfo = "MemTotal:       16316360 kB\nSwapTotal:       2097148 kB\nSwapFree:        1048576 kB\n";
+
+        assert_eq!(
+            swap_used_bytes_from_meminfo(meminfo),
+            Some((2097148 - 1048576) * 1024)
+        );
+        assert_eq!(swap_used_bytes_from_meminfo("SwapTotal:  10 kB\n"), None);
+        assert_eq!(swap_used_bytes_from_meminfo(""), None);
+    }
+
+    #[test]
+    fn available_disk_bytes_reports_root_and_rejects_missing_paths() {
+        assert!(available_disk_bytes(std::path::Path::new("/")).is_some_and(|bytes| bytes > 0));
+        assert_eq!(
+            available_disk_bytes(std::path::Path::new("/herdr/missing/volume")),
+            None
+        );
     }
 }

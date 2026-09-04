@@ -818,7 +818,7 @@
         {
           "key": "ui.sidebar.agents.rows",
           "type": "list of token rows",
-          "default": "[[\"state_icon\", \"workspace\", \"tab\"], [\"agent\"]]",
+          "default": "[[\"state_icon\", \"workspace\", \"tab\"], [\"agent\", \"state_text\"]]",
           "description": "Default expanded Agent sidebar layout. Entries may be token strings or inline { token, fg, bold, dim } style tables. Supports built-in and $name metadata tokens; at most 16 rows and 16 tokens per row."
         },
         {
@@ -838,6 +838,12 @@
           "type": "list of token rows",
           "default": "[[\"state_icon\", \"workspace\"], [\"branch\", \"git_status\"]]",
           "description": "Expanded Space sidebar layout. Entries may be token strings or inline { token, fg, bold, dim } style tables. Supports built-in and $name metadata tokens; at most 16 rows and 16 tokens per row."
+        },
+        {
+          "key": "ui.sidebar.resources.enabled",
+          "type": "boolean",
+          "default": "true",
+          "description": "Pin free disk space and swap use to the bottom of the expanded sidebar. Readings come from OS APIs and refresh every few seconds; the footer hides itself when the sidebar is too short or the platform cannot report them."
         },
         {
           "key": "ui.accent",

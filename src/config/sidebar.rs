@@ -396,7 +396,7 @@ impl Default for AgentsSidebarConfig {
                     AgentSidebarToken::Workspace,
                     AgentSidebarToken::Tab,
                 ],
-                vec![AgentSidebarToken::Agent],
+                vec![AgentSidebarToken::Agent, AgentSidebarToken::StateText],
             ],
             rows_by_agent: BTreeMap::new(),
             row_gap: DEFAULT_SIDEBAR_ROW_GAP,
@@ -424,11 +424,26 @@ impl Default for SpacesSidebarConfig {
     }
 }
 
+/// Host resource readout pinned to the bottom of the expanded sidebar.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(default)]
+pub struct ResourcesSidebarConfig {
+    /// Show free disk space and swap use below the Agents list.
+    pub enabled: bool,
+}
+
+impl Default for ResourcesSidebarConfig {
+    fn default() -> Self {
+        Self { enabled: true }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Default, Deserialize, Serialize)]
 #[serde(default)]
 pub struct SidebarConfig {
     pub agents: AgentsSidebarConfig,
     pub spaces: SpacesSidebarConfig,
+    pub resources: ResourcesSidebarConfig,
 }
 
 #[cfg(test)]
@@ -446,9 +461,10 @@ mod tests {
                     AgentSidebarToken::Workspace,
                     AgentSidebarToken::Tab,
                 ],
-                vec![AgentSidebarToken::Agent],
+                vec![AgentSidebarToken::Agent, AgentSidebarToken::StateText],
             ]
         );
+        assert!(config.resources.enabled);
         assert!(config.agents.rows_by_agent.is_empty());
         assert_eq!(config.agents.row_gap, 0);
         assert_eq!(
@@ -459,6 +475,33 @@ mod tests {
             ]
         );
         assert_eq!(config.spaces.row_gap, 0);
+    }
+
+    #[test]
+    fn the_resource_footer_is_on_unless_a_config_turns_it_off() {
+        // A config with no sidebar section at all, which is the common case.
+        let bare: crate::config::Config = toml::from_str("").unwrap();
+        assert!(bare.ui.sidebar.resources.enabled);
+
+        // A sidebar section that configures something else entirely.
+        let other: crate::config::Config = toml::from_str(
+            r#"
+[ui.sidebar.agents]
+row_gap = 1
+"#,
+        )
+        .unwrap();
+        assert!(other.ui.sidebar.resources.enabled);
+
+        // Only an explicit opt-out disables it.
+        let disabled: crate::config::Config = toml::from_str(
+            r#"
+[ui.sidebar.resources]
+enabled = false
+"#,
+        )
+        .unwrap();
+        assert!(!disabled.ui.sidebar.resources.enabled);
     }
 
     #[test]

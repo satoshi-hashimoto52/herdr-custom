@@ -372,7 +372,7 @@ const DEFAULT_CONFIG: &str = r##"# herdr configuration
 # [ui.sidebar.agents]
 # Blank rows between agent entries. Set to 1 to restore the previous spacing.
 # row_gap = 0
-# rows = [["state_icon", "workspace", "tab"], ["agent"]]
+# rows = [["state_icon", "workspace", "tab"], ["agent", "state_text"]]
 # Optional canonical agent IDs replace the default rows for matching agents.
 # [ui.sidebar.agents.rows_by_agent]
 # claude = [["state_icon", "workspace", "tab"], ["terminal_title_stripped"], ["agent"]]
@@ -384,6 +384,13 @@ const DEFAULT_CONFIG: &str = r##"# herdr configuration
 # Blank rows between space entries. Set to 1 to restore the previous spacing.
 # row_gap = 0
 # rows = [["state_icon", "workspace"], ["branch", "git_status"]]
+
+# Free disk space and swap use, pinned below the Agents list at the bottom of the
+# expanded sidebar. Readings come from OS APIs, refresh every few seconds, and
+# turn from muted to yellow, peach, and red as space runs low or swap grows.
+# The footer hides itself when the sidebar is too short to spare three rows.
+# [ui.sidebar.resources]
+# enabled = true
 
 # Accent color for highlights, borders, and navigation UI.
 # Accepts: hex (#89b4fa), named colors (cyan, blue, magenta), or rgb(r,g,b)

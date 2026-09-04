@@ -1470,6 +1470,10 @@ pub struct AppState {
     pub agent_view_override: Option<crate::api::schema::AgentViewSetParams>,
     pub sidebar_agents: crate::config::AgentsSidebarConfig,
     pub sidebar_spaces: crate::config::SpacesSidebarConfig,
+    pub sidebar_resources: crate::config::ResourcesSidebarConfig,
+    /// Host disk and swap readings sampled off the render path and cached here,
+    /// so the sidebar footer renders from data instead of querying the OS.
+    pub system_resources: super::system_resources::SystemResources,
     pub next_agent_state_change_seq: u64,
     /// Capture mouse input for Herdr's own mouse UI. When false, Herdr only
     /// captures mouse while the focused pane app requests mouse reporting.
@@ -1863,6 +1867,8 @@ impl AppState {
             agent_view_override: None,
             sidebar_agents: crate::config::AgentsSidebarConfig::default(),
             sidebar_spaces: crate::config::SpacesSidebarConfig::default(),
+            sidebar_resources: crate::config::ResourcesSidebarConfig::default(),
+            system_resources: super::system_resources::SystemResources::default(),
             next_agent_state_change_seq: 0,
             mouse_capture: true,
             copy_on_select: true,

@@ -224,13 +224,79 @@ pub(super) fn state_icon(
     )
 }
 
+/// Marker for an agent whose process died mid-turn.
+///
+/// Width one like every other marker, so an error never reflows a row, and
+/// visually unlike the dots and check so it reads as wrong at a glance.
+const ERROR_ICON: &str = "!";
+
+/// Label for the five states a user reasons about.
+///
+/// Herdr detects `Working` and `Blocked`; the sidebar names them for what the
+/// user is waiting on — the agent is `running`, or it is `waiting` on them.
 pub(super) fn state_label(state: AgentState, seen: bool) -> &'static str {
     match (state, seen) {
-        (AgentState::Blocked, _) => "blocked",
-        (AgentState::Working, _) => "working",
+        (AgentState::Blocked, _) => "waiting",
+        (AgentState::Working, _) => "running",
         (AgentState::Idle, false) => "done",
         (AgentState::Idle, true) => "idle",
         (AgentState::Unknown, _) => "idle",
+    }
+}
+
+/// Pane-level label, including the `error` case that has no `AgentState` of
+/// its own because it comes from a recorded process exit rather than detection.
+pub(super) fn pane_state_label(state: AgentState, seen: bool, errored: bool) -> &'static str {
+    if errored {
+        "error"
+    } else {
+        state_label(state, seen)
+    }
+}
+
+/// Status key used to look up a per-pane label override reported over the API.
+pub(super) fn pane_status_key(state: AgentState, seen: bool, errored: bool) -> &'static str {
+    if errored {
+        "error"
+    } else {
+        match (state, seen) {
+            (AgentState::Idle, false) => "done",
+            (AgentState::Idle, true) => "idle",
+            (AgentState::Working, _) => "working",
+            (AgentState::Blocked, _) => "blocked",
+            (AgentState::Unknown, _) => "unknown",
+        }
+    }
+}
+
+/// Pane-level marker, styled so only `error` raises its voice.
+pub(super) fn pane_state_icon(
+    state: AgentState,
+    seen: bool,
+    errored: bool,
+    indicator_style: StatusIndicatorStyle,
+    p: &Palette,
+) -> (&'static str, Style) {
+    if errored {
+        return (
+            ERROR_ICON,
+            Style::default().fg(p.red).add_modifier(Modifier::BOLD),
+        );
+    }
+    state_icon(state, seen, indicator_style, p)
+}
+
+/// Pane-level label color, keeping `error` as the only emphasized state.
+pub(super) fn pane_state_label_color(
+    state: AgentState,
+    seen: bool,
+    errored: bool,
+    p: &Palette,
+) -> Color {
+    if errored {
+        p.red
+    } else {
+        state_label_color(state, seen, p)
     }
 }
 
@@ -351,6 +417,55 @@ mod tests {
         assert_eq!(
             bottom_center.x,
             area.x + area.width.saturating_sub(bottom_center.width) / 2
+        );
+    }
+
+    #[test]
+    fn state_labels_name_the_five_states_a_user_reasons_about() {
+        let cases = [
+            (AgentState::Working, true, false, "running"),
+            (AgentState::Blocked, true, false, "waiting"),
+            (AgentState::Idle, false, false, "done"),
+            (AgentState::Idle, true, false, "idle"),
+            (AgentState::Unknown, true, false, "idle"),
+            // A recorded mid-turn exit outranks whatever detection last saw.
+            (AgentState::Working, true, true, "error"),
+            (AgentState::Idle, true, true, "error"),
+        ];
+
+        for (state, seen, errored, expected) in cases {
+            assert_eq!(pane_state_label(state, seen, errored), expected);
+        }
+    }
+
+    #[test]
+    fn error_status_key_is_distinct_so_overrides_can_target_it() {
+        assert_eq!(pane_status_key(AgentState::Working, true, false), "working");
+        assert_eq!(pane_status_key(AgentState::Blocked, true, false), "blocked");
+        assert_eq!(pane_status_key(AgentState::Idle, false, false), "done");
+        assert_eq!(pane_status_key(AgentState::Idle, true, false), "idle");
+        assert_eq!(pane_status_key(AgentState::Unknown, true, false), "unknown");
+        assert_eq!(pane_status_key(AgentState::Working, true, true), "error");
+    }
+
+    #[test]
+    fn error_marker_stays_one_cell_wide_and_visually_emphasized() {
+        let palette = Palette::catppuccin();
+
+        let (symbol, style) = pane_state_icon(
+            AgentState::Working,
+            true,
+            true,
+            StatusIndicatorStyle::Dots,
+            &palette,
+        );
+
+        assert_eq!(display_width_u16(symbol), 1);
+        assert_eq!(style.fg, Some(palette.red));
+        assert!(style.add_modifier.contains(Modifier::BOLD));
+        assert_eq!(
+            pane_state_label_color(AgentState::Idle, true, true, &palette),
+            palette.red
         );
     }
 }

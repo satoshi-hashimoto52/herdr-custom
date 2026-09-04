@@ -363,6 +363,12 @@ pub(super) fn render_panes(
                 && app.pane_exposes_host_cursor(ws_idx, info.id);
             rt.render(frame, info.inner_rect, show_cursor);
             render_pane_scrollbar(app, frame, info, rt);
+            render_completion_marker_rows(
+                frame,
+                info.inner_rect,
+                &app.palette,
+                app.host_terminal_theme,
+            );
 
             let should_dim = !info.is_focused && multi_pane && !terminal_active;
             if should_dim {
@@ -837,6 +843,124 @@ fn render_copy_mode_search_highlights(
             }
         }
     }
+}
+
+/// Rows an agent prints to mark the start of its completion report.
+///
+/// An explicit display contract with the agent, not a guess about what the
+/// pane contains: a row is decorated only when its entire visible text equals
+/// one of these, ignoring surrounding blanks. No substring, prefix, or pattern
+/// match is performed, and this never feeds agent state detection.
+///
+/// The second form exists because Claude Code draws U+23FA and a space ahead
+/// of the first line of each of its messages, which is the line the marker
+/// lands on. That one decoration is accepted verbatim, measured from a live
+/// pane; nothing else about the agent's rendering is assumed.
+const COMPLETION_MARKER_ROWS: [&str; 2] = [
+    "\u{2501}\u{2501} 完了報告 \u{2501}\u{2501}",
+    "\u{23FA} \u{2501}\u{2501} 完了報告 \u{2501}\u{2501}",
+];
+
+/// Marker background on dark and light hosts.
+///
+/// Terminal cells carry no alpha — neither `Color` nor SGR `48;2;r;g;b` has a
+/// channel for it — so translucency cannot be expressed here. These are opaque
+/// colors picked to read as a deep tint once the host terminal applies its own
+/// background opacity.
+///
+/// Cells carry no alpha, so the see-through look comes from how the color sits
+/// against the host background rather than from any transparency of its own: it
+/// holds the neon hue but drops most of the chroma, and no channel is allowed
+/// below the host background, since a tint that darkens the substrate reads as
+/// paint instead of a veil. Blended it gives 9.6:1 to 12.2:1 against white; the
+/// floor it is held to is 4.5:1 on that blended result.
+const COMPLETION_MARKER_ON_DARK: Rgb = (53, 86, 52);
+const COMPLETION_MARKER_ON_LIGHT: Rgb = (198, 232, 208);
+
+/// Whether this row's visible text is exactly one of the accepted markers.
+fn row_is_completion_marker(buf: &ratatui::buffer::Buffer, inner: Rect, y: u16) -> bool {
+    COMPLETION_MARKER_ROWS
+        .iter()
+        .any(|expected| row_reads_exactly(buf, inner, y, expected))
+}
+
+/// Whether this row's visible text is exactly `expected`.
+///
+/// Compares cell symbols in place, so an ordinary row costs a couple of reads
+/// and no allocation — this runs per row, per pane, per frame, and bails on the
+/// first symbol that differs. Only blanks around the text are ignored; anything
+/// else on the row disqualifies it.
+fn row_reads_exactly(buf: &ratatui::buffer::Buffer, inner: Rect, y: u16, expected: &str) -> bool {
+    let blank = |symbol: &str| symbol.is_empty() || symbol == " ";
+    let mut x = 0;
+
+    while x < inner.width && blank(buf[(inner.x + x, inner.y + y)].symbol()) {
+        x += 1;
+    }
+
+    let mut rest = expected;
+    while x < inner.width && !rest.is_empty() {
+        let symbol = buf[(inner.x + x, inner.y + y)].symbol();
+        // A wide glyph keeps its text in the first cell and leaves the next
+        // one empty, so continuation cells are skipped rather than matched.
+        if symbol.is_empty() {
+            x += 1;
+            continue;
+        }
+        let Some(tail) = rest.strip_prefix(symbol) else {
+            return false;
+        };
+        rest = tail;
+        x += 1;
+    }
+    if !rest.is_empty() {
+        return false;
+    }
+
+    (x..inner.width).all(|x| blank(buf[(inner.x + x, inner.y + y)].symbol()))
+}
+
+/// Paints the completion marker's row across the full pane width.
+///
+/// Only the background is touched, so the pane keeps its own foreground colors
+/// and the terminal's own cell widths, wide glyphs, and scrollback are
+/// untouched. Selection and copy-mode highlights are drawn afterwards and
+/// still win.
+fn render_completion_marker_rows(
+    frame: &mut Frame,
+    inner: Rect,
+    p: &Palette,
+    host_theme: crate::terminal_theme::TerminalTheme,
+) {
+    if inner.width == 0 || inner.height == 0 {
+        return;
+    }
+
+    let buf = frame.buffer_mut();
+    let mut bg = None;
+    for y in 0..inner.height {
+        if !row_is_completion_marker(buf, inner, y) {
+            continue;
+        }
+        let bg = *bg.get_or_insert_with(|| completion_marker_bg(p, host_theme));
+        for x in 0..inner.width {
+            buf[(inner.x + x, inner.y + y)].set_bg(bg);
+        }
+    }
+}
+
+fn completion_marker_bg(p: &Palette, host_theme: crate::terminal_theme::TerminalTheme) -> Color {
+    let background = host_theme
+        .background
+        .map(terminal_theme_to_rgb)
+        .or_else(|| color_to_rgb(p.surface_dim))
+        .unwrap_or((30, 30, 46));
+    let target = if relative_luminance(background) < 0.5 {
+        COMPLETION_MARKER_ON_DARK
+    } else {
+        COMPLETION_MARKER_ON_LIGHT
+    };
+    Color::Rgb(target.0, target.1, target.2)
 }
 
 fn render_selection_highlight(
@@ -1517,6 +1641,192 @@ mod tests {
         assert_eq!(info.rect, area);
         assert_eq!(info.scrollbar_rect, None);
         assert_eq!(info.inner_rect, area);
+    }
+
+    /// Writes `text` into row `y` of a fresh buffer, honoring display width so
+    /// wide glyphs occupy the cells they really would on screen.
+    fn buffer_with_row(width: u16, height: u16, y: u16, text: &str) -> ratatui::buffer::Buffer {
+        use unicode_width::UnicodeWidthStr;
+
+        let mut buf = ratatui::buffer::Buffer::empty(Rect::new(0, 0, width, height));
+        let mut x = 0u16;
+        for grapheme in text.chars() {
+            let symbol = grapheme.to_string();
+            let cell_width = UnicodeWidthStr::width(symbol.as_str()).max(1) as u16;
+            if x + cell_width > width {
+                break;
+            }
+            buf[(x, y)].set_symbol(&symbol);
+            for skipped in 1..cell_width {
+                buf[(x + skipped, y)].set_symbol("");
+            }
+            x += cell_width;
+        }
+        buf
+    }
+
+    #[test]
+    fn only_the_exact_completion_marker_row_matches() {
+        let area = Rect::new(0, 0, 40, 1);
+        // U+23FA and a space is what Claude Code draws ahead of the first line
+        // of a message, measured from a live pane.
+        let bare = "\u{2501}\u{2501} 完了報告 \u{2501}\u{2501}";
+        let decorated = "\u{23FA} \u{2501}\u{2501} 完了報告 \u{2501}\u{2501}";
+
+        for accepted in [
+            bare.to_string(),
+            decorated.to_string(),
+            format!("   {bare}"),
+            format!("{bare}   "),
+            format!("  {decorated}  "),
+        ] {
+            let buf = buffer_with_row(area.width, area.height, 0, &accepted);
+            assert!(
+                row_is_completion_marker(&buf, area, 0),
+                "should match: {accepted:?}"
+            );
+        }
+
+        // Everything the marker is deliberately not: substrings, near misses,
+        // the marker with anything else on the row, and the agent decoration
+        // in front of something that is not the marker.
+        for rejected in [
+            "完了報告",
+            "\u{2501}\u{2501} 完了 \u{2501}\u{2501}",
+            "これは完了報告です",
+            "\u{2501}\u{2501} 完了報告 \u{2501}\u{2501} test",
+            "test \u{2501}\u{2501} 完了報告 \u{2501}\u{2501}",
+            "\u{23FA} 完了報告",
+            "\u{23FA} \u{2501}\u{2501} 完了 \u{2501}\u{2501}",
+            "\u{23FA} \u{2501}\u{2501} 完了報告 \u{2501}\u{2501} test",
+            "\u{23FA}\u{2501}\u{2501} 完了報告 \u{2501}\u{2501}",
+            "\u{25CF} \u{2501}\u{2501} 完了報告 \u{2501}\u{2501}",
+            "\u{2501} 完了報告 \u{2501}",
+            "\u{2501}\u{2501}完了報告\u{2501}\u{2501}",
+            "\u{2501}\u{2501} 完了報告 \u{2501}\u{2501}\u{2501}",
+            "",
+            "   ",
+        ] {
+            let buf = buffer_with_row(area.width, area.height, 0, rejected);
+            assert!(
+                !row_is_completion_marker(&buf, area, 0),
+                "should not match: {rejected:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_marker_row_is_painted_full_width_without_touching_its_text() {
+        let palette = Palette::catppuccin();
+        let host_theme = crate::terminal_theme::TerminalTheme {
+            foreground: None,
+            background: Some(crate::terminal_theme::RgbColor {
+                r: 30,
+                g: 30,
+                b: 46,
+            }),
+            ..Default::default()
+        };
+        let marker = "\u{2501}\u{2501} 完了報告 \u{2501}\u{2501}";
+        let inner = Rect::new(0, 0, 30, 3);
+        let backend = ratatui::backend::TestBackend::new(30, 3);
+        let mut terminal = ratatui::Terminal::new(backend).unwrap();
+
+        // Read back the frame buffer this writes into, rather than the backend
+        // buffer: the backend only replays drawn cells, so the trailing cell of
+        // a wide glyph reverts there and would not show the paint.
+        let mut marker_row = Vec::new();
+        let mut other_rows = Vec::new();
+        terminal
+            .draw(|frame| {
+                let seeded = buffer_with_row(30, 3, 1, marker);
+                let plain = buffer_with_row(30, 3, 0, "ordinary output");
+                let buf = frame.buffer_mut();
+                for y in 0..3u16 {
+                    for x in 0..30u16 {
+                        let source = if y == 1 { &seeded } else { &plain };
+                        buf[(x, y)].set_symbol(source[(x, y)].symbol());
+                        buf[(x, y)].set_fg(Color::Rgb(205, 214, 244));
+                    }
+                }
+
+                render_completion_marker_rows(frame, inner, &palette, host_theme);
+
+                let buf = frame.buffer_mut();
+                marker_row = (0..30u16)
+                    .map(|x| (buf[(x, 1)].style(), buf[(x, 1)].symbol().to_string()))
+                    .collect();
+                other_rows = [0u16, 2]
+                    .into_iter()
+                    .flat_map(|y| (0..30u16).map(move |x| (y, x)))
+                    .map(|(y, x)| buf[(x, y)].style())
+                    .collect();
+            })
+            .unwrap();
+
+        let expected = completion_marker_bg(&palette, host_theme);
+
+        // Every column of the row carries the background, past the text.
+        for (x, (style, _)) in marker_row.iter().enumerate() {
+            assert_eq!(style.bg, Some(expected), "column {x}");
+            // Foreground is left alone so the pane keeps its own colors.
+            assert_eq!(style.fg, Some(Color::Rgb(205, 214, 244)), "column {x}");
+        }
+
+        // Neighbouring rows are untouched.
+        for style in &other_rows {
+            assert_ne!(style.bg, Some(expected));
+        }
+
+        // The marker text itself survives unchanged.
+        let drawn: String = marker_row
+            .iter()
+            .map(|(_, symbol)| symbol.as_str())
+            .collect();
+        assert_eq!(drawn.trim_end(), marker);
+    }
+
+    #[test]
+    fn marker_background_follows_host_lightness() {
+        let palette = Palette::catppuccin();
+        let dark = crate::terminal_theme::TerminalTheme {
+            background: Some(crate::terminal_theme::RgbColor {
+                r: 30,
+                g: 30,
+                b: 46,
+            }),
+            ..Default::default()
+        };
+        let light = crate::terminal_theme::TerminalTheme {
+            background: Some(crate::terminal_theme::RgbColor {
+                r: 239,
+                g: 241,
+                b: 245,
+            }),
+            ..Default::default()
+        };
+
+        let on_dark = color_to_rgb(completion_marker_bg(&palette, dark)).unwrap();
+        let on_light = color_to_rgb(completion_marker_bg(&palette, light)).unwrap();
+
+        // A dark host gets a dark tint and a light host a pale one, so the row
+        // never becomes a black bar on a light theme.
+        assert!(relative_luminance(on_dark) < relative_luminance(on_light));
+
+        // The dark tint is deliberately neon, so it is legible only once the
+        // host blends it. Check the contrast a viewer actually sees rather than
+        // the raw color's, which is far below any floor on its own. The floor
+        // is the 4.5:1 the color was tuned to, measured against the least
+        // forgiving backdrop — a darker desktop only helps.
+        let blended = mix_rgb(on_dark, (40, 40, 50), 0.4);
+        let contrast = 1.05 / (relative_luminance(blended) + 0.05);
+        assert!(
+            contrast >= 4.5,
+            "white text on the marker needs 4.5:1 once blended, got {contrast}"
+        );
+        // Green in both cases.
+        assert!(on_dark.1 > on_dark.0 && on_dark.1 > on_dark.2);
+        assert!(on_light.1 > on_light.0 && on_light.1 > on_light.2);
     }
 
     #[test]

@@ -25,6 +25,19 @@ pub enum Signal {
     Kill,
 }
 
+/// Host disk and swap pressure sampled from OS APIs, not shelled-out commands.
+///
+/// Both fields stay `None` on platforms without a supported query so callers
+/// can hide the reading instead of rendering a fabricated zero.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct SystemResourceSample {
+    /// Space a non-root process can actually claim, excluding APFS purgeable
+    /// space that Finder counts as free.
+    pub disk_available_bytes: Option<u64>,
+    /// Swap currently in use, matching the `used` field of `vm.swapusage`.
+    pub swap_used_bytes: Option<u64>,
+}
+
 pub(crate) fn detached_custom_command_process(command: &str) -> std::process::Command {
     let mut process = detached_custom_command_process_platform(command);
     configure_background_command(&mut process);

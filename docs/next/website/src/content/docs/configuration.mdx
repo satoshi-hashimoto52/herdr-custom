@@ -336,7 +336,7 @@ The expanded desktop sidebar renders each inner array in `rows` as one line. The
 row_gap = 0
 rows = [
   ["state_icon", "workspace", "tab"],
-  ["agent"],
+  ["agent", "state_text"],
 ]
 
 [ui.sidebar.spaces]
@@ -350,7 +350,7 @@ rows = [
 Agent rows accept these built-in tokens:
 
 - `state_icon` — colored icon for the agent's semantic state.
-- `state_text` — `idle`, `working`, `blocked`, `done`, or `unknown`, including a reported display label when present.
+- `state_text` — `idle`, `running`, `waiting`, `done`, or `error`, including a reported display label when present. `running` and `waiting` are the detected `working` and `blocked` states named for what you are waiting on; `error` means the agent process exited mid-turn.
 - `workspace` — workspace name.
 - `tab` — tab name when available.
 - `pane` — pane name when available.
@@ -426,6 +426,27 @@ Use `herdr workspace report-metadata` in the same way for custom Space tokens. U
 Metadata reporters provide values only; styling stays in the local sidebar configuration. See [CLI reference: report metadata](/docs/cli-reference/#panes) for limits, clearing, sequencing, and expiry.
 
 Sidebar row settings affect only the expanded desktop sidebar. Collapsed and mobile views keep their compact layouts.
+
+### Sidebar resource footer
+
+The expanded desktop sidebar pins free disk space and swap use to its bottom rows, below the Agents list, so the Agents list scrolls while the readings stay visible:
+
+```text
+────────────────
+SSD   198 GB
+SWAP  0.0 GB
+```
+
+```toml
+[ui.sidebar.resources]
+enabled = true
+```
+
+Readings come from OS APIs rather than shelled-out commands: `statfs` on the APFS Data volume plus `vm.swapusage` on macOS, and `statvfs` with `/proc/meminfo` on Linux. Disk space is the space a process can actually claim, which tracks `df` and `diskutil` rather than the larger purgeable-inclusive figure Finder and System Settings show. Values are in decimal gigabytes.
+
+Sampling runs every four seconds, and only while the expanded sidebar is on screen — a collapsed sidebar, the mobile layout, and `enabled = false` all stop it. A reading holds still when it has not changed, so the footer does not flicker.
+
+Free space reads muted above 50 GB, yellow from 30 to 50 GB, peach from 20 to 30 GB, and bold red below 20 GB. Swap reads muted below 5 GB, yellow from 5 to 10 GB, and peach above that. Swap stays visible at `0.0 GB`. A narrow sidebar abbreviates the readings to `198G` and `0.0G`; a sidebar too short to spare three rows hides the footer and keeps its sections. Platforms without a supported query hide the footer instead of reporting a zero.
 
 ## Notifications
 

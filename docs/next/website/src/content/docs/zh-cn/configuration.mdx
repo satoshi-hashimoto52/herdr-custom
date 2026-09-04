@@ -332,7 +332,7 @@ status_indicators = "symbols"
 row_gap = 0
 rows = [
   ["state_icon", "workspace", "tab"],
-  ["agent"],
+  ["agent", "state_text"],
 ]
 
 [ui.sidebar.spaces]
@@ -346,7 +346,7 @@ rows = [
 Agent 行支持以下内置 token：
 
 - `state_icon` — 智能体语义状态的彩色图标。
-- `state_text` — `idle`、`working`、`blocked`、`done` 或 `unknown`；如果报告中包含显示标签，也会一并显示。
+- `state_text` — `idle`、`running`、`waiting`、`done` 或 `error`；如果报告中包含显示标签，也会一并显示。`running` 和 `waiting` 是检测到的 `working` 与 `blocked` 状态，按“你在等什么”重新命名；`error` 表示智能体进程在处理过程中退出。
 - `workspace` — 工作区名称。
 - `tab` — 标签页名称（如有）。
 - `pane` — 窗格名称（如有）。
@@ -422,6 +422,27 @@ herdr pane report-metadata <pane_id> \
 元数据上报方只提供值；样式由本地侧边栏配置控制。有关限制、清除、顺序和过期值的信息，请参阅 [CLI 参考：报告元数据](/docs/cli-reference/#panes)。
 
 侧边栏行设置仅影响展开的桌面侧边栏。折叠视图和移动视图仍使用紧凑布局。
+
+### 侧边栏资源页脚
+
+展开的桌面侧边栏会把可用磁盘空间和交换区用量固定在底部、Agents 列表下方，因此 Agents 列表滚动时这些读数仍然可见：
+
+```text
+────────────────
+SSD   198 GB
+SWAP  0.0 GB
+```
+
+```toml
+[ui.sidebar.resources]
+enabled = true
+```
+
+读数直接来自操作系统 API，而不是调用外部命令：macOS 使用针对 APFS Data 卷的 `statfs` 和 `vm.swapusage`，Linux 使用 `statvfs` 与 `/proc/meminfo`。磁盘空间是进程实际可以占用的空间，与 `df` 和 `diskutil` 一致，而不是 Finder 和系统设置显示的、包含可清除空间的更大数值。单位为十进制 GB。
+
+采样每四秒一次，且仅在展开的侧边栏可见时进行；折叠侧边栏、移动布局以及 `enabled = false` 都会停止采样。读数未变化时不会重绘，因此页脚不会闪烁。
+
+可用空间在 50 GB 以上显示为柔和色，30 至 50 GB 为黄色，20 至 30 GB 为桃色，低于 20 GB 为加粗红色。交换区在 5 GB 以下为柔和色，5 至 10 GB 为黄色，更高为桃色。交换区为 0 时仍显示 `0.0 GB`。侧边栏较窄时会缩写为 `198G` 和 `0.0G`；高度不足三行时会隐藏页脚并保留各分区。无法获取这些数据的平台会隐藏页脚，而不是显示 0。
 
 ## 通知
 

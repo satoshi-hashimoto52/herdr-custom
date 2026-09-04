@@ -20,6 +20,8 @@ pub struct PaneDetail {
     pub agent: Option<Agent>,
     pub state: AgentState,
     pub seen: bool,
+    /// Agent process died mid-turn, which the sidebar shows as `error`.
+    pub errored: bool,
     pub last_agent_state_change_seq: Option<u64>,
     pub state_labels: HashMap<String, String>,
     pub tokens: HashMap<String, String>,
@@ -38,7 +40,16 @@ impl Tab {
             .filter_map(|id| {
                 let pane = self.panes.get(id)?;
                 let terminal = terminals.get(&pane.attached_terminal_id)?;
-                let agent_kind_label = terminal.effective_agent_label().map(str::to_string);
+                // A mid-turn process exit releases the agent identity, so the
+                // exited agent is used as a fallback to keep this pane in the
+                // Agents list long enough to report the failure.
+                let errored_agent = terminal.agent_exited_mid_turn();
+                let agent_kind_label = terminal
+                    .effective_agent_label()
+                    .map(str::to_string)
+                    .or_else(|| {
+                        errored_agent.map(|agent| crate::detect::agent_label(agent).to_string())
+                    });
                 let fallback_agent_label = terminal
                     .agent_name
                     .as_deref()
@@ -60,9 +71,10 @@ impl Tab {
                     terminal_title_stripped: terminal.terminal_title_stripped(),
                     agent_label,
                     agent_kind_label,
-                    agent: terminal.effective_known_agent(),
+                    agent: terminal.effective_known_agent().or(errored_agent),
                     state: terminal.state,
                     seen: pane.seen,
+                    errored: errored_agent.is_some(),
                     last_agent_state_change_seq: terminal.last_agent_state_change_seq,
                     state_labels: presentation.state_labels,
                     tokens: terminal.metadata_tokens.values(),
