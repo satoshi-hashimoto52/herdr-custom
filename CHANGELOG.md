@@ -8,7 +8,9 @@
 - Agents whose process exits mid-turn now report `error`, based on the recorded process exit rather than pane output, and `error` is accepted as a `state_labels` key for per-pane overrides.
 
 ### Changed
-- Sidebar agent states are now labelled for what the user is waiting on: detected `working` reads as `running`, and `blocked` reads as `waiting`. The socket API keeps its existing `idle`/`working`/`blocked`/`done`/`unknown` values.
+- Sidebar agent states are now labelled for what the user is waiting on: detected `blocked` reads as `waiting`, while `working` keeps its own name. This is the displayed label only — the state machine, the internal state names, and the socket API keep their existing `idle`/`working`/`blocked`/`done`/`unknown` values.
+- Sidebar state colors now hold their palette hue and move only in saturation and lightness, lifted far enough to read against a dark background without recoloring the rest of the sidebar. Light palettes and palettes built from ANSI color names are left as they are.
+- The tab name in the Agents list now renders in a warm accent (`#FFB375` on dark themes, the palette's `peach` otherwise), so the project a row belongs to can be picked out at a glance. It follows the `tab` token rather than any particular name, so every tab is covered — including auto-named ones and any tab added later — and it holds through selection and Navigate mode. The workspace name, the separator, the agent name, and the state label keep their own colors.
 
 ## [0.8.2] - 2026-08-19
 

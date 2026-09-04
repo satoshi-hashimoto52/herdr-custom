@@ -11,8 +11,8 @@ use ratatui::{
 use self::tokens::{ResolvedToken, ResolvedTokenKind, SpaceTokenContext};
 use super::scrollbar::{render_scrollbar, should_show_scrollbar};
 use super::status::{
-    pane_state_icon, pane_state_label, pane_state_label_color, pane_status_key, state_icon,
-    state_label, state_label_color,
+    pane_state_icon, pane_state_label, pane_state_label_color, pane_status_key,
+    project_label_color, state_icon, state_label, state_label_color,
 };
 use super::text::{display_width, display_width_u16, truncate_end};
 use crate::app::state::{AgentPanelSort, Palette};
@@ -1230,6 +1230,7 @@ fn resolved_token_spans(
     state_icon: (&str, Style),
     state_text_style: Style,
     workspace_style: Style,
+    tab_style: Style,
     secondary_style: Style,
     custom_style: Style,
     p: &Palette,
@@ -1361,8 +1362,13 @@ fn resolved_token_spans(
                     apply_token_style(workspace_style, token.style),
                 ));
             }
-            ResolvedTokenKind::Tab(text)
-            | ResolvedTokenKind::Pane(text)
+            ResolvedTokenKind::Tab(text) => {
+                spans.push(Span::styled(
+                    truncate_end(text, budgets[index]),
+                    apply_token_style(tab_style, token.style),
+                ));
+            }
+            ResolvedTokenKind::Pane(text)
             | ResolvedTokenKind::Agent(text)
             | ResolvedTokenKind::Branch(text) => {
                 spans.push(Span::styled(
@@ -1582,6 +1588,7 @@ fn render_workspace_list(
                 name_style,
                 branch_style,
                 branch_style,
+                branch_style,
                 p,
                 card.rect
                     .width
@@ -1734,6 +1741,10 @@ fn render_agent_detail(
         // Brighter than the section headings and no longer dimmed: the agent
         // name is content, not chrome, and was the hardest row to read.
         let agent_style = Style::default().fg(p.subtext0);
+        // The tab name is how a person says which project a row belongs to, so
+        // it carries the one warm accent in the list rather than the same
+        // muted color as everything around it.
+        let project_style = Style::default().fg(project_label_color(p));
         let state_icon = pane_state_icon(
             detail.state,
             detail.seen,
@@ -1749,6 +1760,7 @@ fn render_agent_detail(
                 state_icon,
                 status_style,
                 name_style,
+                project_style,
                 agent_style,
                 agent_style,
                 p,
@@ -1903,10 +1915,8 @@ mod tests {
         // The project leads its own row; the agent and its state share the next
         // one, so a narrow sidebar never has to squeeze them together.
         assert!(first.contains("one"));
-        assert!(!first.contains("running"));
-        assert_eq!(second, "   pi · running");
-        // Herdr detects this as `Working`; the sidebar names it for the user.
-        assert!(!second.contains("working"));
+        assert!(!first.contains("working"));
+        assert_eq!(second, "   pi · working");
 
         let workspace_x = find_symbol_x(buffer, body.y, body.width, "o");
         let workspace_style = buffer[(workspace_x, body.y)].style();
@@ -2177,6 +2187,7 @@ rows = [[{ token = "git_status", fg = "#123456" }]]
             Style::default(),
             Style::default(),
             Style::default(),
+            Style::default(),
             &crate::app::state::AppState::test_new().palette,
             20,
         );
@@ -2286,6 +2297,7 @@ rows = [[{ token = "git_status", fg = "#123456" }]]
                 "修复🙂标题很长".into(),
             ))],
             ("", Style::default()),
+            Style::default(),
             Style::default(),
             Style::default(),
             Style::default(),
@@ -2757,12 +2769,12 @@ rows = [[{ token = "git_status", fg = "#123456" }]]
         assert_eq!(buffer[(detail_area.x + 2, detail_area.y)].symbol(), "×");
         assert_eq!(
             buffer[(detail_area.x + 2, detail_area.y)].style().fg,
-            Some(app.palette.red)
+            Some(state_label_color(AgentState::Blocked, true, &app.palette))
         );
         assert_eq!(buffer[(detail_area.x + 2, detail_area.y + 1)].symbol(), "✓");
         assert_eq!(
             buffer[(detail_area.x + 2, detail_area.y + 1)].style().fg,
-            Some(app.palette.teal)
+            Some(state_label_color(AgentState::Idle, false, &app.palette))
         );
     }
 
@@ -3686,12 +3698,12 @@ rows = [[{ token = "git_status", fg = "#123456" }]]
         let recovered = resolved_agent_rows(&app, &entry);
         assert_eq!(
             recovered[1][1],
-            ResolvedToken::unstyled(ResolvedTokenKind::StateText("running".into()))
+            ResolvedToken::unstyled(ResolvedTokenKind::StateText("working".into()))
         );
     }
 
     #[test]
-    fn a_working_agent_reads_as_running_in_the_default_rows() {
+    fn a_working_agent_reads_as_working_in_the_default_rows() {
         let mut app = crate::app::state::AppState::test_new();
         let workspace = Workspace::test_new("one");
         let pane_id = workspace.tabs[0].root_pane;
@@ -3711,6 +3723,138 @@ rows = [[{ token = "git_status", fg = "#123456" }]]
             expanded_sidebar_sections(area, app.sidebar_section_split, sidebar_footer_rows(&app));
         let body = agent_panel_body_rect(agent_area, false);
 
-        assert_eq!(row_text(&buffer, body.y + 1, 25), "   pi · running");
+        assert_eq!(row_text(&buffer, body.y + 1, 25), "   pi · working");
+    }
+
+    /// Builds one workspace whose tabs carry the given names, each with an
+    /// agent attached, so the agent list has one row group per tab.
+    fn app_with_named_tabs(names: &[&str]) -> crate::app::state::AppState {
+        let mut app = crate::app::state::AppState::test_new();
+        let mut workspace = Workspace::test_new("space");
+        for name in names {
+            workspace.test_add_tab(Some(name));
+        }
+        app.workspaces = vec![workspace];
+        app.ensure_test_terminals();
+        app.active = Some(0);
+        for tab_idx in 0..app.workspaces[0].tabs.len() {
+            let pane_id = app.workspaces[0].tabs[tab_idx].root_pane;
+            let terminal_id = app.workspaces[0].tabs[tab_idx].panes[&pane_id]
+                .attached_terminal_id
+                .clone();
+            let terminal_state = app
+                .terminals
+                .get_mut(&terminal_id)
+                .expect("test terminal should exist");
+            terminal_state.detected_agent = Some(Agent::Claude);
+            terminal_state.state = AgentState::Idle;
+        }
+        app
+    }
+
+    /// Foreground colors of the cells spelling `needle` on row `y`.
+    fn fg_colors_of(
+        buffer: &ratatui::buffer::Buffer,
+        y: u16,
+        width: u16,
+        needle: &str,
+    ) -> Vec<Color> {
+        let x = find_symbol_x(buffer, y, width, &needle[0..1]);
+        (0..needle.chars().count() as u16)
+            .map(|offset| buffer[(x + offset, y)].fg)
+            .collect()
+    }
+
+    #[test]
+    fn every_tab_name_carries_the_project_accent_whatever_it_is_called() {
+        // Names chosen to be unlike each other and unlike anything in the code:
+        // the accent follows the token, never a particular string.
+        let names = ["@trm", "CoreBeasts", "release/2.0"];
+        let app = app_with_named_tabs(&names);
+        let area = Rect::new(0, 0, 26, 26);
+        let buffer = render_sidebar_to_buffer(&app, area);
+        let (_, agent_area) =
+            expanded_sidebar_sections(area, app.sidebar_section_split, sidebar_footer_rows(&app));
+        let body = agent_panel_body_rect(agent_area, false);
+        let accent = project_label_color(&app.palette);
+
+        // The first tab is auto-named, so the rows under test are the ones the
+        // named tabs produce: two rows each, name row then agent row.
+        for (index, name) in names.iter().enumerate() {
+            let y = body.y + 2 + index as u16 * 2;
+            let row = row_text(&buffer, y, area.width - 1);
+            assert!(row.contains(name), "row {y} should name the tab: {row:?}");
+            let colors = fg_colors_of(&buffer, y, body.width, name);
+            assert_eq!(colors.len(), name.chars().count());
+            assert!(
+                colors.iter().all(|color| *color == accent),
+                "{name} is not fully accented: {colors:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_tab_accent_survives_selection_and_the_navigate_cursor() {
+        let names = ["@trm", "CoreBeasts"];
+        let area = Rect::new(0, 0, 26, 26);
+        let accent = crate::app::state::AppState::test_new().palette;
+        let accent = project_label_color(&accent);
+
+        for mode in [Mode::Terminal, Mode::Navigate] {
+            // Walk the selection across every tab: whichever row is active, and
+            // whichever row the navigate cursor sits on, the name stays accented.
+            for active_tab in 0..=names.len() {
+                let mut app = app_with_named_tabs(&names);
+                app.mode = mode;
+                app.workspaces[0].active_tab = active_tab;
+                let buffer = render_sidebar_to_buffer(&app, area);
+                let (_, agent_area) = expanded_sidebar_sections(
+                    area,
+                    app.sidebar_section_split,
+                    sidebar_footer_rows(&app),
+                );
+                let body = agent_panel_body_rect(agent_area, false);
+
+                for (index, name) in names.iter().enumerate() {
+                    let y = body.y + 2 + index as u16 * 2;
+                    let colors = fg_colors_of(&buffer, y, body.width, name);
+                    assert!(
+                        colors.iter().all(|color| *color == accent),
+                        "{name} lost the accent with tab {active_tab} active in {mode:?}: {colors:?}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn the_tab_accent_is_the_only_thing_recolored_on_the_row() {
+        let app = app_with_named_tabs(&["CoreBeasts"]);
+        let area = Rect::new(0, 0, 26, 26);
+        let buffer = render_sidebar_to_buffer(&app, area);
+        let (_, agent_area) =
+            expanded_sidebar_sections(area, app.sidebar_section_split, sidebar_footer_rows(&app));
+        let body = agent_panel_body_rect(agent_area, false);
+        let p = &app.palette;
+        let y = body.y + 2;
+
+        // Workspace name and separator keep the colors they always had.
+        assert_eq!(
+            fg_colors_of(&buffer, y, body.width, "space"),
+            vec![p.subtext0; 5]
+        );
+        let separator_x = find_symbol_x(&buffer, y, body.width, "·");
+        assert_eq!(buffer[(separator_x, y)].fg, p.overlay0);
+
+        // The agent row below is untouched by this change.
+        let agent_row = y + 1;
+        assert_eq!(
+            fg_colors_of(&buffer, agent_row, body.width, "claude"),
+            vec![p.subtext0; 6]
+        );
+        assert_eq!(
+            fg_colors_of(&buffer, agent_row, body.width, "idle"),
+            vec![state_label_color(AgentState::Idle, true, p); 4]
+        );
     }
 }

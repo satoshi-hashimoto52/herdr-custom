@@ -1,7 +1,7 @@
 # herdr
 
 > **Fork notice** — this is a personal fork of [herdrdev/herdr](https://github.com/herdrdev/herdr), based on **v0.8.2**. Changes on top of upstream:
-> sidebar SSD/SWAP resource footer · agent state display improvements · completion-report marker highlighting / styling.
+> sidebar SSD/SWAP resource footer · agent state display (`working`/`waiting` labels, lifted state colors, accented tab names) · completion-report marker highlighting / styling.
 > Upstream is licensed Apache-2.0; see [LICENSE](LICENSE).
 
 

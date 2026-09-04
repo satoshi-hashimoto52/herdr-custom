@@ -349,10 +349,10 @@ rows = [
 
 Agent rows accept these built-in tokens:
 
-- `state_icon` — colored icon for the agent's semantic state.
-- `state_text` — `idle`, `running`, `waiting`, `done`, or `error`, including a reported display label when present. `running` and `waiting` are the detected `working` and `blocked` states named for what you are waiting on; `error` means the agent process exited mid-turn.
+- `state_icon` — colored icon for the agent's semantic state. On dark themes the state colors keep their palette hue and are lifted toward the fluorescent end of it, so the state reads at a glance without recoloring the rest of the sidebar.
+- `state_text` — `idle`, `working`, `waiting`, `done`, or `error`, including a reported display label when present. `waiting` is the detected `blocked` state named for what you are waiting on; `error` means the agent process exited mid-turn.
 - `workspace` — workspace name.
-- `tab` — tab name when available.
+- `tab` — tab name when available. It renders in a warm accent, whatever the tab is called, so the project a row belongs to can be picked out of the list; the workspace name, the separator, the agent name, and the state keep their own colors.
 - `pane` — pane name when available.
 - `agent` — detected or reported agent display name.
 - `terminal_title` — latest OSC 0/2 terminal title after safety normalization.

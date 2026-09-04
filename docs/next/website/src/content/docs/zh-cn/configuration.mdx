@@ -345,10 +345,10 @@ rows = [
 
 Agent 行支持以下内置 token：
 
-- `state_icon` — 智能体语义状态的彩色图标。
-- `state_text` — `idle`、`running`、`waiting`、`done` 或 `error`；如果报告中包含显示标签，也会一并显示。`running` 和 `waiting` 是检测到的 `working` 与 `blocked` 状态，按“你在等什么”重新命名；`error` 表示智能体进程在处理过程中退出。
+- `state_icon` — 智能体语义状态的彩色图标。在深色主题下保留调色板自身的色相，并向荧光方向提升饱和度与明度，无需调亮侧边栏其他文字即可一眼看出状态。
+- `state_text` — `idle`、`working`、`waiting`、`done` 或 `error`；如果报告中包含显示标签，也会一并显示。`waiting` 是检测到的 `blocked` 状态，按“你在等什么”重新命名；`error` 表示智能体进程在处理过程中退出。
 - `workspace` — 工作区名称。
-- `tab` — 标签页名称（如有）。
+- `tab` — 标签页名称（如有）。无论标签页叫什么，都以暖色强调渲染，便于一眼看出该行属于哪个项目；工作区名称、分隔符、智能体名称与状态显示保持原有颜色。
 - `pane` — 窗格名称（如有）。
 - `agent` — 检测到或报告的智能体显示名称。
 - `terminal_title` — 经过安全规范化的最新 OSC 0/2 终端标题。

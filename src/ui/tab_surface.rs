@@ -303,11 +303,11 @@ mod tests {
         assert!(frame.cursor.is_some());
         assert_eq!(frame.hyperlinks, vec![uri.to_owned()]);
         // Covers the whole desktop frame, so a deliberate sidebar restyle moves
-        // it. Last updated when the sidebar headings, agent names, and resource
-        // footer were brightened off the dimmest palette entries.
+        // it. Last updated when the project name took the warm accent and the
+        // state labels were lifted toward the fluorescent end of their hues.
         assert_eq!(
             frame_digest(&frame),
-            "e9d60bfb0488df4efedcdb0daddaf82d395bd75c50fbda3c0172f6b80e5b270a"
+            "115a3b8ffd02ca2d4271f56b7cae8f7b960c7b168e423e644bc9310105518862"
         );
     }
 
@@ -324,7 +324,7 @@ mod tests {
         assert_eq!(frame.cursor, None);
         assert_eq!(
             frame_digest(&frame),
-            "295608a66067f1e1f066c0adb3cf427e8a2d68bba8f68949fb72d464dcd8baab"
+            "87929363ac764d92e179beacd235bfa08c9242e7a175c2ce8b42aaea96ee40ad"
         );
     }
 }

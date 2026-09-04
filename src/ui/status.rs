@@ -232,12 +232,14 @@ const ERROR_ICON: &str = "!";
 
 /// Label for the five states a user reasons about.
 ///
-/// Herdr detects `Working` and `Blocked`; the sidebar names them for what the
-/// user is waiting on — the agent is `running`, or it is `waiting` on them.
+/// Herdr detects `Working` and `Blocked`; the sidebar keeps `working` as the
+/// word for the first and names the second for what the user is waiting on.
+/// This is the displayed label only — [`pane_status_key`] still reports the
+/// state names the socket API and per-pane overrides are keyed by.
 pub(super) fn state_label(state: AgentState, seen: bool) -> &'static str {
     match (state, seen) {
         (AgentState::Blocked, _) => "waiting",
-        (AgentState::Working, _) => "running",
+        (AgentState::Working, _) => "working",
         (AgentState::Idle, false) => "done",
         (AgentState::Idle, true) => "idle",
         (AgentState::Unknown, _) => "idle",
@@ -280,7 +282,9 @@ pub(super) fn pane_state_icon(
     if errored {
         return (
             ERROR_ICON,
-            Style::default().fg(p.red).add_modifier(Modifier::BOLD),
+            Style::default()
+                .fg(vivid(p.red, p, BLOCKED_LIFT))
+                .add_modifier(Modifier::BOLD),
         );
     }
     state_icon(state, seen, indicator_style, p)
@@ -294,7 +298,7 @@ pub(super) fn pane_state_label_color(
     p: &Palette,
 ) -> Color {
     if errored {
-        p.red
+        vivid(p.red, p, BLOCKED_LIFT)
     } else {
         state_label_color(state, seen, p)
     }
@@ -302,12 +306,114 @@ pub(super) fn pane_state_label_color(
 
 pub(super) fn state_label_color(state: AgentState, seen: bool, p: &Palette) -> Color {
     match (state, seen) {
-        (AgentState::Blocked, _) => p.red,
-        (AgentState::Working, _) => p.yellow,
-        (AgentState::Idle, false) => p.teal,
-        (AgentState::Idle, true) => p.green,
-        (AgentState::Unknown, _) => p.overlay0,
+        (AgentState::Blocked, _) => vivid(p.red, p, BLOCKED_LIFT),
+        (AgentState::Working, _) => vivid(p.yellow, p, WORKING_LIFT),
+        (AgentState::Idle, false) => vivid(p.teal, p, DONE_LIFT),
+        (AgentState::Idle, true) => vivid(p.green, p, IDLE_LIFT),
+        (AgentState::Unknown, _) => vivid(p.overlay0, p, UNKNOWN_LIFT),
     }
+}
+
+/// Accent for the tab name — the word that says which project a row belongs to.
+///
+/// A fixed warm orange rather than a lift of the palette's own peach: peach as
+/// the pastel themes ship it lands close enough to skin tone that it stops
+/// reading as orange at label size, and this one accent is meant to be found
+/// without hunting. Light palettes and palettes built from ANSI color names
+/// keep `peach`, for the same reasons the state colors do.
+pub(super) fn project_label_color(p: &Palette) -> Color {
+    if matches!(p.peach, Color::Rgb(..)) && palette_is_dark(p) {
+        Color::Rgb(PROJECT_ACCENT.0, PROJECT_ACCENT.1, PROJECT_ACCENT.2)
+    } else {
+        p.peach
+    }
+}
+
+/// Target saturation and lightness for a lifted color, both 0..=1.
+///
+/// Saturation is a floor rather than a setting, so a theme that ships a more
+/// vivid color than this keeps it; lightness is pinned, since it is what the
+/// contrast against a dark sidebar rests on.
+type Lift = (f32, f32);
+
+/// Attention states run hot and bright; `idle` is lifted least, so a sidebar
+/// full of finished agents stays quiet and the one that needs a person does
+/// not.
+const BLOCKED_LIFT: Lift = (1.0, 0.68);
+const WORKING_LIFT: Lift = (1.0, 0.66);
+const DONE_LIFT: Lift = (1.0, 0.62);
+const IDLE_LIFT: Lift = (0.75, 0.70);
+const UNKNOWN_LIFT: Lift = (0.18, 0.63);
+
+/// The tab-name accent, held apart from the state hues so a project name and a
+/// state label never read as the same color on neighbouring rows.
+const PROJECT_ACCENT: super::panes::Rgb = (255, 179, 117);
+
+/// Push a color toward the fluorescent end of its own hue.
+///
+/// The hue never moves, so a theme keeps its identity and the states keep the
+/// meanings their colors already carry. Two cases are left alone entirely: a
+/// light palette, where the same lift would put pale text on a pale
+/// background, and a palette built from ANSI color names rather than RGB,
+/// where the whole point is that the host terminal picks the color.
+fn vivid(color: Color, p: &Palette, lift: Lift) -> Color {
+    let Color::Rgb(r, g, b) = color else {
+        return color;
+    };
+    if !palette_is_dark(p) {
+        return color;
+    }
+    let (hue, saturation, _) = rgb_to_hsl((r, g, b));
+    let (r, g, b) = hsl_to_rgb(hue, saturation.max(lift.0), lift.1);
+    Color::Rgb(r, g, b)
+}
+
+fn palette_is_dark(p: &Palette) -> bool {
+    super::panes::color_to_rgb(panel_contrast_fg(p))
+        .map(|rgb| super::panes::relative_luminance(rgb) < 0.5)
+        .unwrap_or(true)
+}
+
+/// Hue in degrees, saturation and lightness in 0..=1.
+fn rgb_to_hsl(color: super::panes::Rgb) -> (f32, f32, f32) {
+    let (r, g, b) = (
+        f32::from(color.0) / 255.0,
+        f32::from(color.1) / 255.0,
+        f32::from(color.2) / 255.0,
+    );
+    let max = r.max(g).max(b);
+    let min = r.min(g).min(b);
+    let lightness = (max + min) / 2.0;
+    let span = max - min;
+    if span <= f32::EPSILON {
+        return (0.0, 0.0, lightness);
+    }
+    let saturation = span / (1.0 - (2.0 * lightness - 1.0).abs());
+    let hue = if max == r {
+        60.0 * (((g - b) / span) % 6.0)
+    } else if max == g {
+        60.0 * ((b - r) / span + 2.0)
+    } else {
+        60.0 * ((r - g) / span + 4.0)
+    };
+    ((hue + 360.0) % 360.0, saturation.clamp(0.0, 1.0), lightness)
+}
+
+fn hsl_to_rgb(hue: f32, saturation: f32, lightness: f32) -> super::panes::Rgb {
+    let chroma = (1.0 - (2.0 * lightness - 1.0).abs()) * saturation;
+    let sector = hue / 60.0;
+    let second = chroma * (1.0 - (sector % 2.0 - 1.0).abs());
+    let (r, g, b) = match sector as u32 {
+        0 => (chroma, second, 0.0),
+        1 => (second, chroma, 0.0),
+        2 => (0.0, chroma, second),
+        3 => (0.0, second, chroma),
+        4 => (second, 0.0, chroma),
+        _ => (chroma, 0.0, second),
+    };
+    let base = lightness - chroma / 2.0;
+    let channel = |value: f32| ((value + base) * 255.0).round().clamp(0.0, 255.0) as u8;
+    (channel(r), channel(g), channel(b))
 }
 
 #[cfg(test)]
@@ -338,12 +444,12 @@ mod tests {
             (StatusIndicatorStyle::Dots, ["●", "●", "●", "○", "·"]),
             (StatusIndicatorStyle::Symbols, ["×", "◐", "✓", "○", "·"]),
         ] {
-            for ((state, seen, color), expected_symbol) in [
-                (AgentState::Blocked, true, palette.red),
-                (AgentState::Working, true, palette.yellow),
-                (AgentState::Idle, false, palette.teal),
-                (AgentState::Idle, true, palette.green),
-                (AgentState::Unknown, true, palette.overlay0),
+            for ((state, seen), expected_symbol) in [
+                (AgentState::Blocked, true),
+                (AgentState::Working, true),
+                (AgentState::Idle, false),
+                (AgentState::Idle, true),
+                (AgentState::Unknown, true),
             ]
             .into_iter()
             .zip(expected_symbols)
@@ -351,7 +457,7 @@ mod tests {
                 let (actual_symbol, style) = state_icon(state, seen, indicator_style, &palette);
                 assert_eq!(actual_symbol, expected_symbol);
                 assert_eq!(display_width_u16(actual_symbol), 1);
-                assert_eq!(style.fg, Some(color));
+                assert_eq!(style.fg, Some(state_label_color(state, seen, &palette)));
             }
         }
     }
@@ -423,7 +529,7 @@ mod tests {
     #[test]
     fn state_labels_name_the_five_states_a_user_reasons_about() {
         let cases = [
-            (AgentState::Working, true, false, "running"),
+            (AgentState::Working, true, false, "working"),
             (AgentState::Blocked, true, false, "waiting"),
             (AgentState::Idle, false, false, "done"),
             (AgentState::Idle, true, false, "idle"),
@@ -436,6 +542,104 @@ mod tests {
         for (state, seen, errored, expected) in cases {
             assert_eq!(pane_state_label(state, seen, errored), expected);
         }
+    }
+
+    fn hue_of(color: Color) -> f32 {
+        let Color::Rgb(r, g, b) = color else {
+            panic!("expected an rgb color");
+        };
+        rgb_to_hsl((r, g, b)).0
+    }
+
+    fn saturation_of(color: Color) -> f32 {
+        let Color::Rgb(r, g, b) = color else {
+            panic!("expected an rgb color");
+        };
+        rgb_to_hsl((r, g, b)).1
+    }
+
+    #[test]
+    fn state_colors_are_lifted_without_moving_off_their_hue() {
+        let palette = Palette::catppuccin();
+        let cases = [
+            (AgentState::Blocked, true, palette.red),
+            (AgentState::Working, true, palette.yellow),
+            (AgentState::Idle, false, palette.teal),
+            (AgentState::Idle, true, palette.green),
+            (AgentState::Unknown, true, palette.overlay0),
+        ];
+
+        for (state, seen, source) in cases {
+            let lifted = state_label_color(state, seen, &palette);
+            assert!(
+                (hue_of(lifted) - hue_of(source)).abs() < 1.0,
+                "{state:?} changed hue: {source:?} -> {lifted:?}"
+            );
+            assert!(
+                saturation_of(lifted) >= saturation_of(source),
+                "{state:?} lost saturation: {source:?} -> {lifted:?}"
+            );
+        }
+
+        // `idle` is the one state deliberately left quieter than the rest, so a
+        // sidebar full of finished agents does not shout.
+        let idle = saturation_of(state_label_color(AgentState::Idle, true, &palette));
+        let blocked = saturation_of(state_label_color(AgentState::Blocked, true, &palette));
+        assert!(idle < blocked);
+    }
+
+    #[test]
+    fn lifted_state_colors_stay_readable_on_a_dark_sidebar() {
+        let palette = Palette::catppuccin();
+        // The sidebar inherits the terminal background; this is the darkest
+        // ground the lifted colors are expected to sit on.
+        let background = super::super::panes::relative_luminance((40, 44, 52));
+        for (state, seen) in [
+            (AgentState::Blocked, true),
+            (AgentState::Working, true),
+            (AgentState::Idle, false),
+            (AgentState::Idle, true),
+            (AgentState::Unknown, true),
+        ] {
+            let Color::Rgb(r, g, b) = state_label_color(state, seen, &palette) else {
+                panic!("expected an rgb color");
+            };
+            let foreground = super::super::panes::relative_luminance((r, g, b));
+            let contrast =
+                (foreground.max(background) + 0.05) / (foreground.min(background) + 0.05);
+            assert!(contrast >= 4.5, "{state:?} fell to {contrast:.2}:1");
+        }
+    }
+
+    #[test]
+    fn light_and_terminal_palettes_keep_their_own_state_colors() {
+        let latte = Palette::catppuccin_latte();
+        assert_eq!(
+            state_label_color(AgentState::Working, true, &latte),
+            latte.yellow
+        );
+        assert_eq!(project_label_color(&latte), latte.peach);
+
+        // Palettes built from ANSI names leave the choice to the host terminal.
+        let terminal = Palette::terminal();
+        assert_eq!(
+            state_label_color(AgentState::Working, true, &terminal),
+            terminal.yellow
+        );
+    }
+
+    #[test]
+    fn the_project_accent_reads_as_orange() {
+        let palette = Palette::catppuccin();
+        let orange = project_label_color(&palette);
+        assert_eq!(orange, Color::Rgb(255, 179, 117));
+        let hue = hue_of(orange);
+        assert!((15.0..45.0).contains(&hue), "hue {hue} is not orange");
+        assert!(saturation_of(orange) > 0.9);
+        // Far enough from the `working` label that the two never read as one
+        // color on neighbouring rows.
+        let working = hue_of(state_label_color(AgentState::Working, true, &palette));
+        assert!((working - hue).abs() > 10.0);
     }
 
     #[test]
@@ -460,12 +664,13 @@ mod tests {
             &palette,
         );
 
+        let errored_red = pane_state_label_color(AgentState::Idle, true, true, &palette);
         assert_eq!(display_width_u16(symbol), 1);
-        assert_eq!(style.fg, Some(palette.red));
+        assert_eq!(style.fg, Some(errored_red));
         assert!(style.add_modifier.contains(Modifier::BOLD));
         assert_eq!(
-            pane_state_label_color(AgentState::Idle, true, true, &palette),
-            palette.red
+            errored_red,
+            state_label_color(AgentState::Blocked, true, &palette)
         );
     }
 }

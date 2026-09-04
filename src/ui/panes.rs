@@ -988,7 +988,7 @@ fn render_selection_highlight(
     }
 }
 
-type Rgb = (u8, u8, u8);
+pub(super) type Rgb = (u8, u8, u8);
 
 fn automatic_selection_style(
     p: &Palette,
@@ -1047,7 +1047,7 @@ fn mix_rgb(base: Rgb, target: Rgb, amount: f32) -> Rgb {
     )
 }
 
-fn relative_luminance(color: Rgb) -> f32 {
+pub(super) fn relative_luminance(color: Rgb) -> f32 {
     fn channel(value: u8) -> f32 {
         let value = f32::from(value) / 255.0;
         if value <= 0.03928 {
@@ -1059,7 +1059,7 @@ fn relative_luminance(color: Rgb) -> f32 {
     0.2126 * channel(color.0) + 0.7152 * channel(color.1) + 0.0722 * channel(color.2)
 }
 
-fn color_to_rgb(color: Color) -> Option<Rgb> {
+pub(super) fn color_to_rgb(color: Color) -> Option<Rgb> {
     match color {
         Color::Reset => None,
         Color::Black => Some((0, 0, 0)),
