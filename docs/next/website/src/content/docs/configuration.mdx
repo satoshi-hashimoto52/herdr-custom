@@ -442,11 +442,21 @@ SWAP  0.0 GB
 enabled = true
 ```
 
-Readings come from OS APIs rather than shelled-out commands: `statfs` on the APFS Data volume plus `vm.swapusage` on macOS, and `statvfs` with `/proc/meminfo` on Linux. Disk space is the space a process can actually claim, which tracks `df` and `diskutil` rather than the larger purgeable-inclusive figure Finder and System Settings show. Values are in decimal gigabytes.
+Readings come from OS APIs rather than shelled-out commands: `statfs` on the APFS Data volume plus `vm.swapusage` on macOS, and `statvfs` with `/proc/meminfo` on Linux. Free space is `f_bavail` — the space an unprivileged process can actually claim, the same figure `df` reports. It need not match what Finder and System Settings show, because those add reclaimable purgeable space to their total. Values are in decimal gigabytes.
 
-Sampling runs every four seconds, and only while the expanded sidebar is on screen — a collapsed sidebar, the mobile layout, and `enabled = false` all stop it. A reading holds still when it has not changed, so the footer does not flicker.
+Free space is read once at startup and every 30 seconds after that. Swap keeps its own four-second beat. Either way sampling runs only while the expanded sidebar is on screen — a collapsed sidebar, the mobile layout, and `enabled = false` all stop it. A reading holds still when it has not changed, so the footer does not flicker.
 
-Free space reads muted above 50 GB, yellow from 30 to 50 GB, peach from 20 to 30 GB, and bold red below 20 GB. Swap reads muted below 5 GB, yellow from 5 to 10 GB, and peach above that. Swap stays visible at `0.0 GB`. A narrow sidebar abbreviates the readings to `198G` and `0.0G`; a sidebar too short to spare three rows hides the footer and keeps its sections. Platforms without a supported query hide the footer instead of reporting a zero.
+The free-space row marks its own refreshes:
+
+```text
+SSD   198 GB ✓   just re-read
+SSD   198 GB !   the last read failed
+SSD   198 GB     steady state
+```
+
+The green `✓` stays up for five seconds after a successful read, including a read that returns the same number, and a second success inside those five seconds restarts them. A failed read keeps the last good value and shows a yellow `!` until a read succeeds, at which point the `!` becomes a fresh `✓`. Before the first successful read there is no value to qualify, so the row stays hidden rather than showing a bare marker.
+
+Free space reads muted above 50 GB, yellow from 30 to 50 GB, peach from 20 to 30 GB, and bold red below 20 GB. Swap reads muted below 5 GB, yellow from 5 to 10 GB, and peach above that. Swap stays visible at `0.0 GB`. A narrow sidebar abbreviates the readings to `198G` and `0.0G`, and drops the refresh marker before it would cost the number a digit; a sidebar too short to spare three rows hides the footer and keeps its sections. Platforms without a supported query hide the footer instead of reporting a zero.
 
 ## Notifications
 

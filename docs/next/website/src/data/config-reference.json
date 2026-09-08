@@ -843,7 +843,7 @@
           "key": "ui.sidebar.resources.enabled",
           "type": "boolean",
           "default": "true",
-          "description": "Pin free disk space and swap use to the bottom of the expanded sidebar. Readings come from OS APIs and refresh every few seconds; the footer hides itself when the sidebar is too short or the platform cannot report them."
+          "description": "Pin free disk space and swap use to the bottom of the expanded sidebar. Readings come from OS APIs; free space is re-read at startup and every 30 seconds, swap every four seconds. The footer hides itself when the sidebar is too short or the platform cannot report them."
         },
         {
           "key": "ui.accent",

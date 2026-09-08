@@ -119,9 +119,10 @@ pub struct App {
     pub(crate) last_api_notification_at: Option<Instant>,
     pub(crate) last_git_remote_status_refresh: Instant,
     pub(crate) last_git_repo_discovery_refresh: Instant,
-    /// `None` until the first host resource sample, which makes the first
-    /// reading due immediately instead of one interval late.
-    pub(crate) last_system_resource_refresh: Option<Instant>,
+    /// Sampling cadence and marker timing for the sidebar's host resource
+    /// footer. Empty deadlines make the first reading due immediately instead
+    /// of one interval late.
+    pub(crate) system_resource_schedule: crate::app::system_resources::SystemResourceSchedule,
     pub(crate) git_refresh_in_flight: bool,
     pub(crate) git_refresh_due_after_in_flight: bool,
     pub(crate) git_identity_refresh_requested: bool,
@@ -758,7 +759,7 @@ impl App {
             event_tx,
             event_rx,
             last_git_remote_status_refresh: Instant::now() - GIT_REMOTE_STATUS_REFRESH_INTERVAL,
-            last_system_resource_refresh: None,
+            system_resource_schedule: Default::default(),
             last_git_repo_discovery_refresh: Instant::now(),
             git_refresh_in_flight: false,
             git_refresh_due_after_in_flight: false,

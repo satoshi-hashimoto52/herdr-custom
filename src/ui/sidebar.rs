@@ -16,7 +16,7 @@ use super::status::{
 };
 use super::text::{display_width, display_width_u16, truncate_end};
 use crate::app::state::{AgentPanelSort, Palette};
-use crate::app::system_resources::ResourcePressure;
+use crate::app::system_resources::{DiskRefreshMarker, ResourcePressure};
 use crate::app::{AppState, Mode};
 use crate::detect::AgentState;
 use crate::terminal::TerminalRuntimeRegistry;
@@ -1141,10 +1141,27 @@ fn resource_pressure_style(pressure: ResourcePressure, p: &Palette) -> Style {
     }
 }
 
-/// One footer line: a padded label followed by its reading.
+/// Marker glyph and color for the disk row's refresh state.
+///
+/// Green says the reading was just re-read — including when the number did not
+/// move — and the warning color says it could not be, so the number beside it
+/// is the last one that was true. Both borrow existing theme colors rather than
+/// introducing decoration of their own.
+fn disk_marker_span(marker: DiskRefreshMarker, p: &Palette) -> Option<Span<'static>> {
+    match marker {
+        DiskRefreshMarker::None => None,
+        DiskRefreshMarker::Refreshed => Some(Span::styled("✓", Style::default().fg(p.green))),
+        DiskRefreshMarker::Stale => Some(Span::styled("!", Style::default().fg(p.yellow))),
+    }
+}
+
+/// One footer line: a padded label, its reading, and an optional marker.
 ///
 /// The reading is truncated to `max_width` so a sidebar narrowed past the
 /// abbreviated form clips the number instead of spilling into the separator.
+/// The marker is the first thing dropped when `marker_width` cannot hold it
+/// beside the reading: a number without its marker still tells the truth, a cut
+/// number does not.
 fn resource_line(
     label: &str,
     value: &str,
@@ -1152,16 +1169,26 @@ fn resource_line(
     max_width: usize,
     label_style: Style,
     value_style: Style,
+    marker: Option<Span<'static>>,
+    marker_width: usize,
 ) -> Line<'static> {
     let prefix = format!(" {label}");
     let pad = " ".repeat(label_column.saturating_sub(label.len()));
     let used = display_width(&prefix).saturating_add(pad.len());
     let value = truncate_end(value, max_width.saturating_sub(used));
-    Line::from(vec![
+    let marker = marker.filter(|marker| {
+        used + display_width(&value) + 1 + display_width(&marker.content) <= marker_width
+    });
+    let mut spans = vec![
         Span::styled(prefix, label_style),
         Span::styled(pad, label_style),
         Span::styled(value, value_style),
-    ])
+    ];
+    if let Some(marker) = marker {
+        spans.push(Span::styled(" ", label_style));
+        spans.push(marker);
+    }
+    Line::from(spans)
 }
 
 /// Draws the host resource readout pinned below the Agents list.
@@ -1195,9 +1222,13 @@ fn render_sidebar_resources(app: &AppState, frame: &mut Frame, area: Rect) {
         (format_resource_gb_short, FOOTER_LABEL_COLUMN_NARROW)
     };
 
-    for (row, (label, reading)) in [
-        ("SSD", app.system_resources.disk_available),
-        ("SWAP", app.system_resources.swap_used),
+    for (row, (label, reading, marker)) in [
+        (
+            "SSD",
+            app.system_resources.disk_available,
+            disk_marker_span(app.system_resources.disk_marker, p),
+        ),
+        ("SWAP", app.system_resources.swap_used, None),
     ]
     .into_iter()
     .enumerate()
@@ -1220,6 +1251,11 @@ fn render_sidebar_resources(app: &AppState, frame: &mut Frame, area: Rect) {
             row_width as usize,
             label_style,
             resource_pressure_style(reading.pressure, p),
+            marker,
+            // The footer rect already stops short of the separator, and
+            // `row_width` gives the bottom row's column back to the collapse
+            // toggle, so the row's own width is the marker's whole budget.
+            row_width as usize,
         );
         frame.render_widget(Paragraph::new(line), Rect::new(area.x, row_y, row_width, 1));
     }
@@ -3424,6 +3460,14 @@ rows = [[{ token = "git_status", fg = "#123456" }]]
     }
 
     fn app_with_readings(disk_bytes: u64, swap_bytes: u64) -> crate::app::state::AppState {
+        app_with_marked_readings(disk_bytes, swap_bytes, DiskRefreshMarker::None)
+    }
+
+    fn app_with_marked_readings(
+        disk_bytes: u64,
+        swap_bytes: u64,
+        disk_marker: DiskRefreshMarker,
+    ) -> crate::app::state::AppState {
         use crate::app::system_resources::{ResourceReading, SystemResources};
 
         let mut app = crate::app::state::AppState::test_new();
@@ -3440,6 +3484,7 @@ rows = [[{ token = "git_status", fg = "#123456" }]]
                 bytes: swap_bytes,
                 pressure: crate::app::system_resources::ResourcePressure::Normal,
             }),
+            disk_marker,
         };
         app
     }
@@ -3574,6 +3619,76 @@ rows = [[{ token = "git_status", fg = "#123456" }]]
                 "width {width} overdrew the toggle"
             );
         }
+    }
+
+    #[test]
+    fn the_refresh_marker_follows_the_reading_without_disturbing_it() {
+        let area = Rect::new(0, 0, 26, 20);
+        let palette = crate::app::state::Palette::catppuccin();
+
+        // A successful refresh: a green tick after the unchanged reading.
+        let app = app_with_marked_readings(197_895_245_824, 0, DiskRefreshMarker::Refreshed);
+        let buffer = render_sidebar_to_buffer(&app, area);
+        assert_eq!(row_text(&buffer, 18, 25), " SSD   198 GB ✓");
+        assert_eq!(buffer[(14, 18)].fg, palette.green);
+        // The reading itself keeps the color and format it already had.
+        assert_eq!(row_text(&buffer, 18, 13), " SSD   198 GB");
+        assert_eq!(buffer[(7, 18)].fg, palette.overlay1);
+        // Swap is untouched by the disk row's marker.
+        assert_eq!(row_text(&buffer, 19, 24), " SWAP  0.0 GB");
+
+        // A failed refresh: the last good reading, flagged.
+        let app = app_with_marked_readings(197_895_245_824, 0, DiskRefreshMarker::Stale);
+        let buffer = render_sidebar_to_buffer(&app, area);
+        assert_eq!(row_text(&buffer, 18, 25), " SSD   198 GB !");
+        assert_eq!(buffer[(14, 18)].fg, palette.yellow);
+
+        // No marker: exactly what the footer drew before markers existed.
+        let app = app_with_marked_readings(197_895_245_824, 0, DiskRefreshMarker::None);
+        let buffer = render_sidebar_to_buffer(&app, area);
+        assert_eq!(row_text(&buffer, 18, 25), " SSD   198 GB");
+    }
+
+    #[test]
+    fn a_narrow_sidebar_drops_the_marker_before_it_touches_the_reading() {
+        for marker in [DiskRefreshMarker::Refreshed, DiskRefreshMarker::Stale] {
+            let app = app_with_marked_readings(197_895_245_824, 0, marker);
+
+            for width in 4..=40u16 {
+                let area = Rect::new(0, 0, width, 20);
+                let buffer = render_sidebar_to_buffer(&app, area);
+                let footer = sidebar_footer_rect(area, sidebar_footer_rows(&app));
+                if footer == Rect::default() {
+                    continue;
+                }
+
+                let text = row_text(&buffer, footer.y + 1, area.width);
+                // Whatever the width, the number survives intact and the
+                // separator column stays the separator's.
+                assert!(!text.contains('…'), "width {width} truncated: {text:?}");
+                assert!(
+                    text.contains("198"),
+                    "width {width} lost the reading: {text:?}"
+                );
+                assert_eq!(
+                    buffer[(area.width - 1, footer.y + 1)].symbol(),
+                    "│",
+                    "width {width} overran the separator"
+                );
+            }
+        }
+
+        // The abbreviated ` SSD  198G` needs 10 columns and the marker two
+        // more; a column goes to the separator, so a 13-column sidebar is
+        // where the marker starts fitting.
+        let app = app_with_marked_readings(197_895_245_824, 0, DiskRefreshMarker::Refreshed);
+        let marker_row = |width: u16| {
+            let area = Rect::new(0, 0, width, 20);
+            row_text(&render_sidebar_to_buffer(&app, area), 18, width - 1)
+        };
+        assert_eq!(marker_row(12), " SSD  198G");
+        assert_eq!(marker_row(13), " SSD  198G ✓");
+        assert_eq!(marker_row(16), " SSD   198 GB ✓");
     }
 
     #[test]
