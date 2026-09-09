@@ -486,10 +486,18 @@ asking something has done no work yet, so nothing is printed beside `wait`
 until work actually starts, and the previous turn's total is never carried into
 the next one.
 
-Working time is held in memory for the life of the server process. Restarting
-the server — and a live handoff, which is a restart that keeps your panes —
-starts every row from zero again. Nothing is written to disk and no figure is
-carried across.
+Working time is measured from the state changes themselves rather than sampled
+while drawing, so it survives everything short of the process ending: reloading
+your configuration, collapsing the sidebar, selecting a different agent, and a
+repeated report of the state a pane is already in all leave a running total
+alone. It is held in memory for the life of the server process, though —
+restarting the server, and a live handoff, which is a restart that keeps your
+panes, start every row from zero again. Nothing is written to disk and no
+figure is carried across.
+
+There is nothing to configure. The figure adds no settings of its own, and it
+costs no polling: the row is redrawn on the second the number changes and at no
+other time, on the loop Herdr already runs.
 
 Under an hour the figure reads `MM:SS`, at or over one `H:MM:SS`, and hours are
 not wrapped at 24. Part-seconds are dropped rather than rounded up, so it never
