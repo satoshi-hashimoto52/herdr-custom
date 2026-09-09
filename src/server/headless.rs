@@ -4818,6 +4818,7 @@ impl HeadlessServer {
         changed |= self.app.handle_tab_bar_status_tasks(now);
         if self.has_app_client() {
             changed |= self.app.handle_system_resource_refresh(now);
+            changed |= self.app.handle_work_timer_tick(now);
         }
 
         if geometry_dirty {

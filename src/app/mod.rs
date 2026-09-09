@@ -8,6 +8,7 @@ pub(crate) mod actions;
 mod agent_resume;
 pub(crate) mod agent_view;
 mod agents;
+pub(crate) mod work_timer;
 pub(crate) use agents::{AGENT_START_SETTLE_DELAY, MAX_AGENT_START_TIMEOUT};
 mod api;
 mod api_helpers;
@@ -644,6 +645,8 @@ impl App {
             sidebar_agents: config.ui.sidebar.agents.clone(),
             sidebar_spaces: config.ui.sidebar.spaces.clone(),
             sidebar_resources: config.ui.sidebar.resources.clone(),
+            work_timers: work_timer::WorkTimers::default(),
+            work_clock: None,
             system_resources: system_resources::SystemResources::default(),
             next_agent_state_change_seq: 0,
             mouse_capture: config.ui.mouse_capture,

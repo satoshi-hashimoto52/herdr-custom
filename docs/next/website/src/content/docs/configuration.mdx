@@ -349,8 +349,8 @@ rows = [
 
 Agent rows accept these built-in tokens:
 
-- `state_icon` — colored icon for the agent's semantic state. On dark themes the state colors keep their palette hue and are lifted toward the fluorescent end of it, so the state reads at a glance without recoloring the rest of the sidebar.
-- `state_text` — `idle`, `working`, `waiting`, `done`, or `error`, including a reported display label when present. `waiting` is the detected `blocked` state named for what you are waiting on; `error` means the agent process exited mid-turn.
+- `state_icon` — colored icon for the agent's semantic state, in the same color as the state word beside it. `run` takes the theme's accent blue, a color that sits with the rest of the interface rather than shouting over it; `wait` takes its mauve, since being asked a question is the agent working normally, not a fault; and `err` keeps the red, which now belongs to it alone, so a row waiting for you and a row that failed are told apart by color and not only by the word. `idle`, `done`, and `unknown` keep their palette hue, lifted toward the fluorescent end of it on dark themes so the state reads at a glance without recoloring the rest of the sidebar. A theme that ships the same color for both its accent and its mauve, and one built from ANSI color names, keep the earlier yellow and red for these two states instead. This is display color only — the state machine, the internal state names, and the socket API are unchanged.
+- `state_text` — `idle`, `run`, `wait`, `done`, or `err`, including a reported display label when present. The words are short, four characters at most, because a row spends its width on the agent name and the working time and the state only has to be recognised; the color and the marker carry the same distinction. `run` means the agent is processing, `wait` is the detected `blocked` state named for what you are waiting on — your input or instruction — and `err` means the agent process exited mid-turn or otherwise needs attention. These are displayed labels only: the internal state names, the detector's own names, and the socket API keep `idle`/`working`/`blocked`/`done`/`unknown`, and a `state_labels` override is still keyed by the long name.
 - `workspace` — workspace name.
 - `tab` — tab name when available. It renders in a warm accent, whatever the tab is called, so the project a row belongs to can be picked out of the list; the workspace name, the separator, the agent name, and the state keep their own colors.
 - `pane` — pane name when available.
@@ -457,6 +457,50 @@ SSD   198 GB     steady state
 The green `✓` stays up for five seconds after a successful read, including a read that returns the same number, and a second success inside those five seconds restarts them. A failed read keeps the last good value and shows a yellow `!` until a read succeeds, at which point the `!` becomes a fresh `✓`. Before the first successful read there is no value to qualify, so the row stays hidden rather than showing a bare marker.
 
 Free space reads muted above 50 GB, yellow from 30 to 50 GB, peach from 20 to 30 GB, and bold red below 20 GB. Swap reads muted below 5 GB, yellow from 5 to 10 GB, and peach above that. Swap stays visible at `0.0 GB`. A narrow sidebar abbreviates the readings to `198G` and `0.0G`, and drops the refresh marker before it would cost the number a digit; a sidebar too short to spare three rows hides the footer and keeps its sections. Platforms without a supported query hide the footer instead of reporting a zero.
+
+### Agent working time
+
+Each Agent row prints how long its agent has actually spent working, next to
+the state word:
+
+```text
+● one · logs
+  claude · run 01:24
+```
+
+This is measured time, not an estimate of progress: there is no percentage and
+no bar, because nothing here can know how much of a task is left. What it can
+know is how much work has gone in.
+
+| State | Figure |
+| --- | --- |
+| `idle` | none — the next turn starts again from zero |
+| `run` | counting up, once a second |
+| `wait` | held at the total so far; waiting on a person is not working |
+| `done` | the final total, frozen |
+| `err` | the total as of the failure, frozen |
+
+Answering a question resumes the same turn from where it paused. Starting new
+work from `done` or `err` begins again at `00:00`. A turn that opens by
+asking something has done no work yet, so nothing is printed beside `wait`
+until work actually starts, and the previous turn's total is never carried into
+the next one.
+
+Working time is held in memory for the life of the server process. Restarting
+the server — and a live handoff, which is a restart that keeps your panes —
+starts every row from zero again. Nothing is written to disk and no figure is
+carried across.
+
+Under an hour the figure reads `MM:SS`, at or over one `H:MM:SS`, and hours are
+not wrapped at 24. Part-seconds are dropped rather than rounded up, so it never
+reads ahead of the work. It is drawn in the sidebar's muted secondary color
+rather than the state's own, so the state word keeps carrying the state.
+
+The figure is the lowest-priority thing on the row: a sidebar too narrow to
+hold it drops it whole rather than cutting it to `01:`, and never trades the
+agent name or the state word for it. Rows keep the two-row shape they always
+had, and the row only redraws on the second it actually changes — a list of
+finished agents costs nothing at all.
 
 ## Notifications
 

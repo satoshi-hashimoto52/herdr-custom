@@ -1,7 +1,7 @@
 # herdr
 
 > **Fork notice** — this is a personal fork of [herdrdev/herdr](https://github.com/herdrdev/herdr), based on **v0.8.2**. Changes on top of upstream:
-> sidebar SSD/SWAP resource footer (free space re-read every 30s, with `✓`/`!` refresh markers) · agent state display (`working`/`waiting` labels, lifted state colors, accented tab names) · completion-report marker highlighting / styling.
+> sidebar SSD/SWAP resource footer (free space re-read every 30s, with `✓`/`!` refresh markers) · per-agent working time beside the state word · agent state display (short `idle`/`run`/`wait`/`done`/`err` labels with blue `run` / mauve `wait` / red `err` state colors, accented tab names) · completion-report marker highlighting / styling.
 > Upstream is licensed Apache-2.0; see [LICENSE](LICENSE).
 
 

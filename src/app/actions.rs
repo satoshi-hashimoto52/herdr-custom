@@ -1668,6 +1668,9 @@ impl AppState {
         }
         for pane_id in pane_ids {
             self.plugin_panes.remove(&pane_id);
+            // A closed pane's working time goes with it, so a long session
+            // does not keep totals for rows nobody can see.
+            self.work_timers.clear(pane_id);
         }
     }
 
@@ -2953,6 +2956,25 @@ impl AppState {
         }
     }
 
+    /// Drives one pane's detector report through the real state-change path.
+    #[cfg(test)]
+    pub(crate) fn update_terminal_state_for_test<F>(
+        &mut self,
+        pane_id: PaneId,
+        update: F,
+    ) -> Option<PaneStateUpdate>
+    where
+        F: FnOnce(&mut crate::terminal::TerminalState) -> Option<EffectiveStateChange>,
+    {
+        self.update_terminal_state(pane_id, |terminal| {
+            Some(TerminalStateMutation {
+                effective_state_change: update(terminal),
+                session_ref_changed: false,
+                agent_released: false,
+            })
+        })
+    }
+
     fn update_terminal_state<F>(&mut self, pane_id: PaneId, update: F) -> Option<PaneStateUpdate>
     where
         F: FnOnce(&mut crate::terminal::TerminalState) -> Option<TerminalStateMutation>,
@@ -3005,6 +3027,14 @@ impl AppState {
             if let Some(terminal) = self.terminals.get_mut(&terminal_id) {
                 terminal.last_agent_state_change_seq = Some(self.next_agent_state_change_seq);
             }
+            // Working time is measured from the transitions themselves rather
+            // than sampled while drawing, so it keeps running while the
+            // sidebar is collapsed and cannot be restarted by a redraw. This
+            // is the one place a pane's state is known to have actually
+            // changed, which is also what stops a repeated report of the same
+            // state from rewinding the clock.
+            self.work_timers
+                .on_state_change(pane_id, change.previous_state, change.state, now);
         }
         let seen = self.apply_pane_state_change(ws_idx, pane_id, &change, suppress_completion)?;
         let update = PaneStateUpdate {

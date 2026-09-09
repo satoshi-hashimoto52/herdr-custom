@@ -1261,9 +1261,11 @@ fn render_sidebar_resources(app: &AppState, frame: &mut Frame, area: Rect) {
     }
 }
 
+#[allow(clippy::too_many_arguments)] // one span builder, one argument per token style
 fn resolved_token_spans(
     resolved: &[ResolvedToken],
     state_icon: (&str, Style),
+    work_time: Option<(&str, Style)>,
     state_text_style: Style,
     workspace_style: Style,
     tab_style: Style,
@@ -1391,6 +1393,12 @@ fn resolved_token_spans(
                     truncate_end(text, budgets[index]),
                     apply_token_style(state_text_style, token.style),
                 ));
+                // The working time belongs to the state word, so it follows it
+                // directly rather than trailing the whole row.
+                if let Some((time, style)) = work_time {
+                    spans.push(Span::styled(" ", state_text_style));
+                    spans.push(Span::styled(time.to_string(), style));
+                }
             }
             ResolvedTokenKind::Workspace(text) => {
                 spans.push(Span::styled(
@@ -1620,6 +1628,7 @@ fn render_workspace_list(
             spans.extend(resolved_token_spans(
                 resolved,
                 state_icon,
+                None,
                 state_text_style,
                 name_style,
                 branch_style,
@@ -1686,6 +1695,83 @@ fn render_workspace_list(
             menu_rect,
         );
     }
+}
+
+/// Leading indent an Agent row draws before its first token.
+fn agent_row_indent(row_index: usize) -> u16 {
+    if row_index == 0 {
+        1
+    } else {
+        3
+    }
+}
+
+/// Width a row wants before any elision: every token at full length plus the
+/// separators between them.
+///
+/// This is what decides whether the working time is affordable. Measuring the
+/// row unelided means the time is dropped before the existing layout has to
+/// give anything up, rather than after.
+fn resolved_row_natural_width(resolved: &[ResolvedToken], state_icon: (&str, Style)) -> usize {
+    let token_width = |token: &ResolvedToken| match &token.kind {
+        ResolvedTokenKind::StateIcon => display_width(state_icon.0),
+        ResolvedTokenKind::GitStatus { ahead, behind } => {
+            usize::from(*ahead > 0) * display_width(&format!("↑{ahead}"))
+                + usize::from(*behind > 0) * display_width(&format!("↓{behind}"))
+                + usize::from(*ahead > 0 && *behind > 0)
+        }
+        ResolvedTokenKind::StateText(text)
+        | ResolvedTokenKind::Workspace(text)
+        | ResolvedTokenKind::Tab(text)
+        | ResolvedTokenKind::Pane(text)
+        | ResolvedTokenKind::Agent(text)
+        | ResolvedTokenKind::TerminalTitle(text)
+        | ResolvedTokenKind::Branch(text)
+        | ResolvedTokenKind::Custom(text) => display_width(text),
+    };
+    let content = resolved.iter().map(token_width).sum::<usize>();
+    let separators = resolved
+        .windows(2)
+        .map(|pair| display_width(tokens::separator(&pair[0], &pair[1])))
+        .sum::<usize>();
+    content + separators
+}
+
+/// The working time this entry will print beside its state word, if any.
+///
+/// Only a turn that has actually run shows a figure: `idle` has nothing to
+/// report, and a pane that has never worked has no timer at all.
+fn entry_work_time(app: &AppState, entry: &AgentPanelEntry) -> Option<String> {
+    // `idle` is the one state with no figure. It is also where a finished
+    // total stops being interesting: the next turn starts from zero anyway,
+    // so nothing has to be cleared for the row to read correctly.
+    if matches!(
+        crate::ui::status::pane_state_label(entry.state, entry.seen, entry.errored),
+        "idle"
+    ) {
+        return None;
+    }
+    let timer = app.work_timers.get(entry.pane_id)?;
+    let now = app.work_clock.unwrap_or_else(std::time::Instant::now);
+    Some(crate::app::work_timer::format_work_duration(
+        timer.elapsed(now),
+    ))
+}
+
+/// Whether `row` has room for `time` beside it without eliding anything.
+///
+/// The time is the first thing to go when a row is tight: a name or a state
+/// word cut short to make space for a clock would be a worse row than one
+/// without the clock.
+fn work_time_fits(
+    resolved: &[ResolvedToken],
+    state_icon: (&str, Style),
+    indent: u16,
+    row_width: u16,
+    time: &str,
+) -> bool {
+    usize::from(indent) + resolved_row_natural_width(resolved, state_icon) + 1 + display_width(time)
+        <= usize::from(row_width)
 }
 
 fn render_agent_detail(
@@ -1789,19 +1875,29 @@ fn render_agent_detail(
             p,
         );
 
+        // Measured working time, printed after the state word. It is the
+        // lowest-priority thing on the row: a row that cannot hold it drops it
+        // whole rather than cutting it to `01:` or squeezing the agent name.
+        let work_time = entry_work_time(app, detail);
+        let work_time_style = Style::default().fg(p.overlay1);
+
         for (row_index, resolved) in rows.iter().take(height as usize).enumerate() {
-            let mut spans = vec![Span::raw(if row_index == 0 { " " } else { "   " })];
+            let indent = agent_row_indent(row_index);
+            let mut spans = vec![Span::raw(" ".repeat(usize::from(indent)))];
+            let row_time = work_time
+                .as_deref()
+                .filter(|time| work_time_fits(resolved, state_icon, indent, body.width, time));
             spans.extend(resolved_token_spans(
                 resolved,
                 state_icon,
+                row_time.map(|time| (time, work_time_style)),
                 status_style,
                 name_style,
                 project_style,
                 agent_style,
                 agent_style,
                 p,
-                body.width
-                    .saturating_sub(if row_index == 0 { 1 } else { 3 }) as usize,
+                body.width.saturating_sub(indent) as usize,
             ));
             frame.render_widget(
                 Paragraph::new(Line::from(spans)).style(row_style),
@@ -1951,8 +2047,8 @@ mod tests {
         // The project leads its own row; the agent and its state share the next
         // one, so a narrow sidebar never has to squeeze them together.
         assert!(first.contains("one"));
-        assert!(!first.contains("working"));
-        assert_eq!(second, "   pi · working");
+        assert!(!first.contains("run"));
+        assert_eq!(second, "   pi · run");
 
         let workspace_x = find_symbol_x(buffer, body.y, body.width, "o");
         let workspace_style = buffer[(workspace_x, body.y)].style();
@@ -2219,6 +2315,7 @@ rows = [[{ token = "git_status", fg = "#123456" }]]
                 style: config.ui.sidebar.spaces.rows[0][0].parts().1,
             }],
             ("", Style::default()),
+            None,
             Style::default(),
             Style::default(),
             Style::default(),
@@ -2268,6 +2365,866 @@ rows = [[{ token = "git_status", fg = "#123456" }]]
         assert_eq!(metrics.max_offset_from_bottom, 0);
         assert_eq!(row_text(buffer, body.y, body.width), " pi");
         assert_eq!(row_text(buffer, body.y + 1, body.width), " claude");
+    }
+
+    /// One workspace, one Claude agent, and a working time already banked.
+    fn app_with_work_time(
+        workspace_name: &str,
+        state: AgentState,
+        seen: bool,
+        seconds: u64,
+        running: bool,
+    ) -> crate::app::state::AppState {
+        use crate::detect::AgentState as S;
+
+        let mut app = crate::app::state::AppState::test_new();
+        let mut workspace = Workspace::test_new(workspace_name);
+        let tab_idx = workspace.test_add_tab(Some("logs"));
+        let pane_id = workspace.tabs[tab_idx].root_pane;
+        workspace.active_tab = tab_idx;
+        app.workspaces = vec![workspace];
+        app.ensure_test_terminals();
+        app.active = Some(0);
+        let terminal_id = app.workspaces[0].tabs[tab_idx].panes[&pane_id]
+            .attached_terminal_id
+            .clone();
+        let terminal = app.terminals.get_mut(&terminal_id).expect("a terminal");
+        terminal.detected_agent = Some(Agent::Claude);
+        terminal.state = state;
+        app.workspaces[0].tabs[tab_idx]
+            .panes
+            .get_mut(&pane_id)
+            .expect("the root pane")
+            .seen = seen;
+
+        // Drive the timer through real transitions rather than poking at it.
+        let start = std::time::Instant::now();
+        let worked = std::time::Duration::from_secs(seconds);
+        app.work_timers
+            .on_state_change(pane_id, S::Idle, S::Working, start);
+        if running {
+            app.work_clock = Some(start + worked);
+        } else {
+            app.work_timers
+                .on_state_change(pane_id, S::Working, state, start + worked);
+            app.work_clock = Some(start + worked + std::time::Duration::from_secs(600));
+        }
+        app
+    }
+
+    fn agent_body(app: &crate::app::state::AppState, area: Rect) -> Rect {
+        let (_, detail) =
+            expanded_sidebar_sections(area, app.sidebar_section_split, sidebar_footer_rows(app));
+        agent_panel_body_rect(detail, false)
+    }
+
+    /// Column a substring starts at, counted in cells rather than bytes.
+    ///
+    /// The separator `·` is two bytes and one column, so `str::find` would put
+    /// everything after it one cell to the right.
+    fn column_of(row: &str, needle: &str) -> u16 {
+        let byte = row
+            .find(needle)
+            .unwrap_or_else(|| panic!("{needle:?} not in {row:?}"));
+        row[..byte].chars().count() as u16
+    }
+
+    fn state_row(app: &crate::app::state::AppState, area: Rect) -> String {
+        let mut terminal = Terminal::new(TestBackend::new(area.width, area.height)).unwrap();
+        terminal
+            .draw(|frame| render_sidebar(app, &TerminalRuntimeRegistry::new(), frame, area))
+            .unwrap();
+        let body = agent_body(app, area);
+        row_text(terminal.backend().buffer(), body.y + 1, body.width)
+    }
+
+    #[test]
+    fn a_working_agent_shows_the_time_it_has_spent() {
+        let app = app_with_work_time("one", AgentState::Working, true, 84, true);
+        assert_eq!(
+            state_row(&app, Rect::new(0, 0, 40, 20)),
+            "   claude · run 01:24"
+        );
+    }
+
+    #[test]
+    fn an_idle_agent_shows_no_time_at_all() {
+        let app = app_with_work_time("one", AgentState::Idle, true, 84, false);
+        let row = state_row(&app, Rect::new(0, 0, 40, 20));
+        assert_eq!(row, "   claude · idle");
+        assert!(!row.contains(':'), "idle should carry no figure: {row:?}");
+    }
+
+    #[test]
+    fn waiting_done_and_error_all_show_a_frozen_figure() {
+        // waiting: the clock stopped, the figure stays.
+        let waiting = app_with_work_time("one", AgentState::Blocked, true, 84, false);
+        assert_eq!(
+            state_row(&waiting, Rect::new(0, 0, 40, 20)),
+            "   claude · wait 01:24"
+        );
+
+        // done: the final total, ten minutes after the fact.
+        let done = app_with_work_time("one", AgentState::Idle, false, 222, false);
+        assert_eq!(
+            state_row(&done, Rect::new(0, 0, 40, 20)),
+            "   claude · done 03:42"
+        );
+    }
+
+    #[test]
+    fn two_agents_with_the_same_name_never_share_a_figure() {
+        // Rows are keyed by `PaneId`, which comes from one global counter, so
+        // two panes running the same agent cannot read each other's total.
+        fn entry(pane_id: crate::layout::PaneId) -> AgentPanelEntry {
+            AgentPanelEntry {
+                ws_idx: 0,
+                tab_idx: 0,
+                pane_id,
+                primary_label: "CoreBeasts".into(),
+                primary_tab_label: None,
+                pane_label: None,
+                terminal_title: None,
+                terminal_title_stripped: None,
+                agent_label: Some("claude".into()),
+                agent_kind_label: Some("claude".into()),
+                agent: Some(Agent::Claude),
+                state: AgentState::Working,
+                seen: true,
+                errored: false,
+                last_agent_state_change_seq: None,
+                state_labels: std::collections::HashMap::new(),
+                tokens: std::collections::HashMap::new(),
+            }
+        }
+
+        use crate::detect::AgentState as S;
+        let first = crate::layout::PaneId::from_raw(1);
+        let second = crate::layout::PaneId::from_raw(2);
+        let mut app = crate::app::state::AppState::test_new();
+        let start = std::time::Instant::now();
+        app.work_timers
+            .on_state_change(first, S::Idle, S::Working, start);
+        app.work_timers.on_state_change(
+            second,
+            S::Idle,
+            S::Working,
+            start + std::time::Duration::from_secs(60),
+        );
+        app.work_clock = Some(start + std::time::Duration::from_secs(84));
+
+        assert_eq!(
+            entry_work_time(&app, &entry(first)).as_deref(),
+            Some("01:24")
+        );
+        assert_eq!(
+            entry_work_time(&app, &entry(second)).as_deref(),
+            Some("00:24")
+        );
+    }
+
+    #[test]
+    fn waiting_reached_without_working_prints_no_figure() {
+        // A turn that opens with a question has done no work, and a total
+        // left over from the turn before it would read as this turn's.
+        use crate::detect::AgentState as S;
+        let app = app_with_work_time("one", AgentState::Blocked, true, 84, false);
+        assert_eq!(
+            state_row(&app, Rect::new(0, 0, 40, 20)),
+            "   claude · wait 01:24",
+            "a wait that follows real work still shows it"
+        );
+
+        let mut fresh = app_with_work_time("one", AgentState::Blocked, true, 84, false);
+        let pane_id = fresh.workspaces[0].tabs[fresh.workspaces[0].active_tab].root_pane;
+        let now = fresh.work_clock.unwrap_or_else(std::time::Instant::now);
+        // The turn ends, then the next one opens by asking something.
+        fresh
+            .work_timers
+            .on_state_change(pane_id, S::Blocked, S::Idle, now);
+        fresh.work_timers.on_state_change(
+            pane_id,
+            S::Idle,
+            S::Blocked,
+            now + std::time::Duration::from_secs(5),
+        );
+        assert_eq!(
+            state_row(&fresh, Rect::new(0, 0, 40, 20)),
+            "   claude · wait",
+            "the finished turn's total must not follow the row into the next one"
+        );
+    }
+
+    #[test]
+    fn the_figure_is_the_only_thing_a_narrow_row_gives_up() {
+        let app = app_with_work_time("one", AgentState::Working, true, 84, true);
+        let mut dropped_at = None;
+        for width in (20..=40u16).rev() {
+            let row = state_row(&app, Rect::new(0, 0, width, 20));
+            if row.contains("01:24") {
+                assert!(
+                    dropped_at.is_none(),
+                    "the figure came back at width {width}"
+                );
+                continue;
+            }
+            dropped_at.get_or_insert(width);
+            // Whatever the width, the figure is never cut into a fragment and
+            // the state word is never traded away for it.
+            assert!(
+                !row.contains("01:"),
+                "width {width} cut the figure: {row:?}"
+            );
+            assert!(!row.contains(':'), "width {width} left part of it: {row:?}");
+            assert!(
+                row.contains("run") || row.contains('…'),
+                "width {width} lost the state word: {row:?}"
+            );
+        }
+        assert!(
+            dropped_at.is_some(),
+            "the figure never dropped, even at width 20"
+        );
+    }
+
+    #[test]
+    fn dropping_the_figure_leaves_the_row_exactly_as_it_was_without_one() {
+        // Same agent, every width, with and without a banked time. Wherever
+        // the figure does not fit, the text that remains has to be identical
+        // to the row that never had one, or the figure has cost something.
+        let with_time = app_with_work_time("one", AgentState::Working, true, 84, true);
+        let mut without = app_with_work_time("one", AgentState::Working, true, 84, true);
+        without.work_timers = crate::app::work_timer::WorkTimers::default();
+
+        let mut dropped_any = false;
+        for width in 14..=40u16 {
+            let area = Rect::new(0, 0, width, 20);
+            let row = state_row(&with_time, area);
+            if row.contains("01:24") {
+                continue;
+            }
+            dropped_any = true;
+            assert_eq!(row, state_row(&without, area), "width {width}");
+        }
+        assert!(dropped_any, "the figure fitted at every width tested");
+    }
+
+    #[test]
+    fn the_short_state_word_buys_the_figure_four_columns() {
+        // `run` is three columns where `working` was seven, so the figure now
+        // survives four columns further in. 22 is the narrowest row that
+        // holds it; the long word could not have fitted it before 26.
+        let app = app_with_work_time("one", AgentState::Working, true, 84, true);
+        assert_eq!(
+            state_row(&app, Rect::new(0, 0, 22, 20)),
+            "   claude · run 01:24"
+        );
+        assert_eq!(state_row(&app, Rect::new(0, 0, 21, 20)), "   claude · run");
+
+        // And the width the figure needs is measured from the label that is
+        // actually drawn, not from a remembered longest word.
+        let waiting = app_with_work_time("one", AgentState::Blocked, true, 84, false);
+        assert_eq!(
+            state_row(&waiting, Rect::new(0, 0, 23, 20)),
+            "   claude · wait 01:24"
+        );
+        assert_eq!(
+            state_row(&waiting, Rect::new(0, 0, 22, 20)),
+            "   claude · wait"
+        );
+    }
+
+    #[test]
+    fn a_long_agent_name_keeps_its_existing_elision() {
+        let area = Rect::new(0, 0, 26, 20);
+        let mut with_time = app_with_work_time("one", AgentState::Working, true, 84, true);
+        let mut without = app_with_work_time("one", AgentState::Working, true, 84, true);
+        for app in [&mut with_time, &mut without] {
+            let pane = app.workspaces[0].tabs[1].root_pane;
+            let terminal_id = app.workspaces[0].tabs[1].panes[&pane]
+                .attached_terminal_id
+                .clone();
+            app.terminals
+                .get_mut(&terminal_id)
+                .expect("a terminal")
+                .agent_name = Some("a-very-long-agent-name".into());
+        }
+        without.work_timers = crate::app::work_timer::WorkTimers::default();
+        assert_eq!(state_row(&with_time, area), state_row(&without, area));
+    }
+
+    #[test]
+    fn the_figure_reads_the_same_selected_or_not() {
+        let area = Rect::new(0, 0, 40, 20);
+        let selected = app_with_work_time("one", AgentState::Working, true, 84, true);
+        let mut unselected = app_with_work_time("one", AgentState::Working, true, 84, true);
+        unselected.active = None;
+        assert_eq!(state_row(&selected, area), state_row(&unselected, area));
+    }
+
+    #[test]
+    fn each_state_prints_its_short_word_and_its_own_figure() {
+        let area = Rect::new(0, 0, 40, 20);
+        assert_eq!(
+            state_row(
+                &app_with_work_time("one", AgentState::Idle, true, 84, false),
+                area
+            ),
+            "   claude · idle",
+            "idle carries no figure"
+        );
+        assert_eq!(
+            state_row(
+                &app_with_work_time("one", AgentState::Working, true, 17, true),
+                area
+            ),
+            "   claude · run 00:17"
+        );
+        assert_eq!(
+            state_row(
+                &app_with_work_time("one", AgentState::Blocked, true, 84, false),
+                area
+            ),
+            "   claude · wait 01:24"
+        );
+        assert_eq!(
+            state_row(
+                &app_with_work_time("one", AgentState::Idle, false, 222, false),
+                area
+            ),
+            "   claude · done 03:42"
+        );
+
+        // `err` needs a recorded mid-turn exit rather than a detected state.
+        let mut errored = app_with_work_time("one", AgentState::Idle, false, 131, false);
+        let tab_idx = errored.workspaces[0].active_tab;
+        let pane = errored.workspaces[0].tabs[tab_idx].root_pane;
+        let terminal_id = errored.workspaces[0].tabs[tab_idx].panes[&pane]
+            .attached_terminal_id
+            .clone();
+        if let Some(terminal) = errored.terminals.get_mut(&terminal_id) {
+            terminal.set_detected_state(Some(Agent::Claude), AgentState::Working);
+            terminal.set_detected_state_with_visible_blocker(
+                Some(Agent::Claude),
+                AgentState::Idle,
+                false,
+                false,
+                true,
+            );
+        }
+        assert_eq!(state_row(&errored, area), "   claude · err 02:11");
+    }
+
+    #[test]
+    fn the_long_state_words_are_gone_from_the_display() {
+        // The detector's names and the API keys keep them; the rows do not.
+        for (state, seen, errored) in [
+            (AgentState::Idle, true, false),
+            (AgentState::Working, true, false),
+            (AgentState::Blocked, true, false),
+            (AgentState::Idle, false, false),
+            (AgentState::Idle, false, true),
+            (AgentState::Unknown, true, false),
+        ] {
+            let word = pane_state_label(state, seen, errored);
+            for long in ["working", "waiting", "error", "blocked", "running"] {
+                assert_ne!(word, long, "{state:?} still prints {long:?}");
+            }
+        }
+        assert_eq!(
+            ["idle", "run", "wait", "done", "err"],
+            [
+                pane_state_label(AgentState::Idle, true, false),
+                pane_state_label(AgentState::Working, true, false),
+                pane_state_label(AgentState::Blocked, true, false),
+                pane_state_label(AgentState::Idle, false, false),
+                pane_state_label(AgentState::Idle, false, true),
+            ]
+        );
+    }
+
+    #[test]
+    fn the_drawn_state_does_not_change_on_its_own() {
+        // Nothing puts the row on a timer of its own: the same state renders
+        // the same way however many frames go by.
+        let app = app_with_work_time("one", AgentState::Blocked, true, 84, false);
+        let area = Rect::new(0, 0, 40, 20);
+        let first = state_row(&app, area);
+        for _ in 0..8 {
+            assert_eq!(state_row(&app, area), first);
+        }
+        assert_eq!(first, "   claude · wait 01:24");
+    }
+
+    #[test]
+    fn the_state_word_and_its_dot_carry_the_agreed_colours() {
+        use ratatui::style::Color;
+
+        let area = Rect::new(0, 0, 40, 20);
+        let project_accent = Color::Rgb(0xff, 0xb3, 0x75);
+        // (state, seen, errored, word, colour)
+        let cases = [
+            (
+                AgentState::Idle,
+                true,
+                false,
+                "idle",
+                Color::Rgb(0x82, 0xec, 0x79),
+            ),
+            (
+                AgentState::Working,
+                true,
+                false,
+                "run",
+                Color::Rgb(0x89, 0xb4, 0xfa),
+            ),
+            (
+                AgentState::Blocked,
+                true,
+                false,
+                "wait",
+                Color::Rgb(0xcb, 0xa6, 0xf7),
+            ),
+            (
+                AgentState::Idle,
+                false,
+                false,
+                "done",
+                Color::Rgb(0x3d, 0xff, 0xdf),
+            ),
+            (
+                AgentState::Idle,
+                false,
+                true,
+                "err",
+                Color::Rgb(0xff, 0x5c, 0x89),
+            ),
+        ];
+
+        for selected in [true, false] {
+            for (state, seen, errored, word, expected) in cases {
+                let mut app =
+                    app_with_work_time("one", state, seen, 84, state == AgentState::Working);
+                if errored {
+                    let tab_idx = app.workspaces[0].active_tab;
+                    let pane = app.workspaces[0].tabs[tab_idx].root_pane;
+                    let terminal_id = app.workspaces[0].tabs[tab_idx].panes[&pane]
+                        .attached_terminal_id
+                        .clone();
+                    if let Some(terminal) = app.terminals.get_mut(&terminal_id) {
+                        terminal.set_detected_state(Some(Agent::Claude), AgentState::Working);
+                        terminal.set_detected_state_with_visible_blocker(
+                            Some(Agent::Claude),
+                            AgentState::Idle,
+                            false,
+                            false,
+                            true,
+                        );
+                    }
+                }
+                if !selected {
+                    app.active = None;
+                }
+
+                let mut terminal =
+                    Terminal::new(TestBackend::new(area.width, area.height)).unwrap();
+                terminal
+                    .draw(|frame| {
+                        render_sidebar(&app, &TerminalRuntimeRegistry::new(), frame, area)
+                    })
+                    .unwrap();
+                let buffer = terminal.backend().buffer();
+                let body = agent_body(&app, area);
+                let head = row_text(buffer, body.y, body.width);
+                let row = row_text(buffer, body.y + 1, body.width);
+                let where_ = format!("{word} selected={selected}");
+
+                // The marker sits at column 1 of the first row.
+                let marker = &buffer[(1, body.y)];
+                assert_eq!(marker.fg, expected, "{where_}: marker");
+                assert_eq!(
+                    marker.symbol(),
+                    if errored {
+                        "!"
+                    } else if word == "idle" {
+                        "○"
+                    } else {
+                        "●"
+                    },
+                    "{where_}: marker glyph"
+                );
+                assert_eq!(
+                    marker.modifier.contains(ratatui::style::Modifier::BOLD),
+                    errored,
+                    "{where_}: only error is emphasized"
+                );
+
+                // The state word, on the second row, in the same colour.
+                let word_x = column_of(&row, word);
+                assert_eq!(
+                    buffer[(word_x, body.y + 1)].fg,
+                    expected,
+                    "{where_}: state word"
+                );
+
+                // The tab name keeps the project accent either way.
+                let tab_x = column_of(&head, "logs");
+                assert_eq!(buffer[(tab_x, body.y)].fg, project_accent, "{where_}: tab");
+            }
+        }
+    }
+
+    #[test]
+    fn waiting_and_error_no_longer_share_a_colour() {
+        let palette = crate::app::state::Palette::catppuccin();
+        let waiting = pane_state_label_color(AgentState::Blocked, true, false, &palette);
+        let errored = pane_state_label_color(AgentState::Idle, false, true, &palette);
+        assert_ne!(waiting, errored);
+        assert_eq!(waiting, palette.mauve);
+    }
+
+    #[test]
+    fn the_figure_is_neutral_and_leaves_the_state_colour_alone() {
+        let palette = crate::app::state::Palette::catppuccin();
+        let area = Rect::new(0, 0, 40, 20);
+        for (state, seen, word) in [
+            (AgentState::Working, true, "run"),
+            (AgentState::Blocked, true, "wait"),
+            (AgentState::Idle, false, "done"),
+        ] {
+            let app = app_with_work_time("one", state, seen, 84, state == AgentState::Working);
+            let mut terminal = Terminal::new(TestBackend::new(area.width, area.height)).unwrap();
+            terminal
+                .draw(|frame| render_sidebar(&app, &TerminalRuntimeRegistry::new(), frame, area))
+                .unwrap();
+            let buffer = terminal.backend().buffer();
+            let body = agent_body(&app, area);
+            let row = row_text(buffer, body.y + 1, body.width);
+
+            let state_x = column_of(&row, word);
+            assert_eq!(
+                buffer[(state_x, body.y + 1)].fg,
+                pane_state_label_color(state, seen, false, &palette),
+                "{word}: the state colour moved"
+            );
+
+            let time_x = column_of(&row, "01:24");
+            let cell = &buffer[(time_x, body.y + 1)];
+            assert_eq!(
+                cell.fg, palette.overlay1,
+                "{word}: the figure is not neutral"
+            );
+            assert!(
+                !cell.modifier.contains(ratatui::style::Modifier::BOLD),
+                "{word}: the figure should not be bold"
+            );
+            // One plain space between the word and the figure.
+            assert_eq!(buffer[(time_x - 1, body.y + 1)].symbol(), " ");
+            assert_eq!(
+                state_x as usize + word.chars().count() + 1,
+                time_x as usize,
+                "{word}: exactly one space between the word and the figure"
+            );
+        }
+    }
+
+    #[test]
+    fn several_agents_each_show_their_own_time() {
+        use crate::detect::AgentState as S;
+        let mut app = crate::app::state::AppState::test_new();
+        let mut workspace = Workspace::test_new("one");
+        workspace.tabs[0].set_custom_name("main".into());
+        let mut panes = vec![workspace.tabs[0].root_pane];
+        for name in ["logs", "build"] {
+            let tab = workspace.test_add_tab(Some(name));
+            panes.push(workspace.tabs[tab].root_pane);
+        }
+        workspace.active_tab = 1;
+        app.workspaces = vec![workspace];
+        app.ensure_test_terminals();
+        app.active = Some(0);
+        for (tab_idx, pane) in panes.iter().enumerate() {
+            let terminal_id = app.workspaces[0].tabs[tab_idx].panes[pane]
+                .attached_terminal_id
+                .clone();
+            let terminal = app.terminals.get_mut(&terminal_id).expect("a terminal");
+            terminal.detected_agent = Some(Agent::Claude);
+            terminal.state = S::Working;
+        }
+        let start = std::time::Instant::now();
+        for (offset, pane) in panes.iter().enumerate() {
+            app.work_timers.on_state_change(
+                *pane,
+                S::Idle,
+                S::Working,
+                start + std::time::Duration::from_secs(offset as u64 * 30),
+            );
+        }
+        app.work_clock = Some(start + std::time::Duration::from_secs(90));
+
+        let area = Rect::new(0, 0, 40, 26);
+        let mut terminal = Terminal::new(TestBackend::new(area.width, area.height)).unwrap();
+        terminal
+            .draw(|frame| render_sidebar(&app, &TerminalRuntimeRegistry::new(), frame, area))
+            .unwrap();
+        let buffer = terminal.backend().buffer();
+        let body = agent_body(&app, area);
+
+        // Started 0s, 30s and 60s ago, read at 90s.
+        let figures: Vec<String> = (0..3)
+            .map(|i| row_text(buffer, body.y + 1 + i * 2, body.width))
+            .collect();
+        assert!(figures[0].ends_with("01:30"), "{:?}", figures[0]);
+        assert!(figures[1].ends_with("01:00"), "{:?}", figures[1]);
+        assert!(figures[2].ends_with("00:30"), "{:?}", figures[2]);
+    }
+
+    #[test]
+    fn the_ssd_footer_still_draws_beside_a_ticking_row() {
+        use crate::app::system_resources::{ResourcePressure, ResourceReading, SystemResources};
+        let mut app = app_with_work_time("one", AgentState::Working, true, 84, true);
+        app.system_resources = SystemResources {
+            disk_available: Some(ResourceReading {
+                bytes: 197_895_245_824,
+                pressure: ResourcePressure::Normal,
+            }),
+            swap_used: Some(ResourceReading {
+                bytes: 0,
+                pressure: ResourcePressure::Normal,
+            }),
+            disk_marker: crate::app::system_resources::DiskRefreshMarker::Refreshed,
+        };
+        let area = Rect::new(0, 0, 40, 20);
+        let mut terminal = Terminal::new(TestBackend::new(area.width, area.height)).unwrap();
+        terminal
+            .draw(|frame| render_sidebar(&app, &TerminalRuntimeRegistry::new(), frame, area))
+            .unwrap();
+        let buffer = terminal.backend().buffer();
+
+        assert!(state_row(&app, area).ends_with("01:24"));
+        let footer = sidebar_footer_rect(area, sidebar_footer_rows(&app));
+        assert_eq!(row_text(buffer, footer.y + 1, 39), " SSD   198 GB ✓");
+        assert_eq!(row_text(buffer, footer.y + 2, 38), " SWAP  0.0 GB");
+    }
+
+    /// Dumps what the sidebar actually draws, cell by cell, for visual review.
+    ///
+    /// Ignored by default because its output is a picture, not an assertion.
+    /// Run it deliberately to inspect the working-time row against the real
+    /// render path and the real palette:
+    ///
+    /// ```text
+    /// cargo nextest run -E 'test(work_time_render_preview)' \
+    ///     --run-ignored all --no-capture
+    /// ```
+    #[test]
+    #[ignore = "prints a cell dump for visual review rather than asserting"]
+    fn work_time_render_preview() {
+        use crate::app::system_resources::{
+            DiskRefreshMarker, ResourcePressure, ResourceReading, SystemResources,
+        };
+        use crate::detect::AgentState as S;
+
+        fn color(c: ratatui::style::Color) -> String {
+            match c {
+                ratatui::style::Color::Rgb(r, g, b) => format!("#{r:02x}{g:02x}{b:02x}"),
+                ratatui::style::Color::Reset => "reset".to_string(),
+                other => format!("{other:?}"),
+            }
+        }
+
+        fn dump(name: &str, app: &crate::app::state::AppState, area: Rect, rows: u16) {
+            let mut terminal = Terminal::new(TestBackend::new(area.width, area.height)).unwrap();
+            terminal
+                .draw(|frame| render_sidebar(app, &TerminalRuntimeRegistry::new(), frame, area))
+                .unwrap();
+            let buffer = terminal.backend().buffer();
+            let body = agent_body(app, area);
+            for row in 0..rows.min(body.height) {
+                let cells = (0..area.width)
+                    .map(|x| {
+                        let cell = &buffer[(x, body.y + row)];
+                        format!("{}|{}|{}", cell.symbol(), color(cell.fg), color(cell.bg))
+                    })
+                    .collect::<Vec<_>>()
+                    .join("\t");
+                println!("PREVIEW\t{name}\t{row}\t{cells}");
+            }
+        }
+
+        let widths = [20u16, 24, 26, 30, 34];
+
+        // Every state, at a handful of elapsed times, both selected and not.
+        let cases: [(&str, AgentState, bool, u64, bool); 9] = [
+            ("idle", S::Idle, true, 84, false),
+            ("working-00-00", S::Working, true, 0, true),
+            ("working-00-05", S::Working, true, 5, true),
+            ("working-01-24", S::Working, true, 84, true),
+            ("working-59-59", S::Working, true, 3_599, true),
+            ("working-1-00-00", S::Working, true, 3_600, true),
+            ("waiting-held", S::Blocked, true, 84, false),
+            ("done-final", S::Idle, false, 222, false),
+            ("error-final", S::Working, true, 131, false),
+        ];
+
+        for (label, state, seen, seconds, running) in cases {
+            for selected in [true, false] {
+                for width in widths {
+                    let mut app = app_with_work_time("one", state, seen, seconds, running);
+                    if !selected {
+                        app.active = None;
+                    }
+                    if label.starts_with("error") {
+                        let pane = app.workspaces[0].tabs[1].root_pane;
+                        let terminal_id = app.workspaces[0].tabs[1].panes[&pane]
+                            .attached_terminal_id
+                            .clone();
+                        if let Some(terminal) = app.terminals.get_mut(&terminal_id) {
+                            terminal.set_detected_state(Some(Agent::Claude), S::Working);
+                            terminal.set_detected_state_with_visible_blocker(
+                                Some(Agent::Claude),
+                                S::Idle,
+                                false,
+                                false,
+                                true,
+                            );
+                        }
+                    }
+                    dump(
+                        &format!(
+                            "{label} {} w{width}",
+                            if selected { "selected" } else { "unselected" }
+                        ),
+                        &app,
+                        Rect::new(0, 0, width, 22),
+                        2,
+                    );
+                }
+            }
+        }
+
+        // A long agent name, to show the figure going before the name elides.
+        for width in widths {
+            let mut app = app_with_work_time("one", AgentState::Working, true, 84, true);
+            let pane = app.workspaces[0].tabs[1].root_pane;
+            let terminal_id = app.workspaces[0].tabs[1].panes[&pane]
+                .attached_terminal_id
+                .clone();
+            if let Some(terminal) = app.terminals.get_mut(&terminal_id) {
+                terminal.agent_name = Some("a-very-long-agent-name".into());
+            }
+            dump(
+                &format!("long-name selected w{width}"),
+                &app,
+                Rect::new(0, 0, width, 22),
+                2,
+            );
+        }
+
+        // A turn that opens with a question: no work has been measured, so
+        // the row shows the state word alone.
+        for width in widths {
+            let mut app = app_with_work_time("one", AgentState::Blocked, true, 84, false);
+            let pane = app.workspaces[0].tabs[1].root_pane;
+            let now = app.work_clock.unwrap_or_else(std::time::Instant::now);
+            app.work_timers
+                .on_state_change(pane, S::Blocked, S::Idle, now);
+            app.work_timers.on_state_change(
+                pane,
+                S::Idle,
+                S::Blocked,
+                now + std::time::Duration::from_secs(5),
+            );
+            dump(
+                &format!("waiting-unworked selected w{width}"),
+                &app,
+                Rect::new(0, 0, width, 22),
+                2,
+            );
+        }
+
+        // One second at a time, so the change can be watched.
+        for seconds in 0..4u64 {
+            let app = app_with_work_time("one", AgentState::Working, true, seconds, true);
+            dump(
+                &format!("tick-{seconds:02} selected w30"),
+                &app,
+                Rect::new(0, 0, 30, 22),
+                2,
+            );
+        }
+
+        // Several agents at once, and the disk footer drawn alongside.
+        for width in [26u16, 34] {
+            let mut app = crate::app::state::AppState::test_new();
+            let mut workspace = Workspace::test_new("one");
+            workspace.tabs[0].set_custom_name("main".into());
+            let mut panes = vec![workspace.tabs[0].root_pane];
+            for name in ["logs", "build"] {
+                let tab = workspace.test_add_tab(Some(name));
+                panes.push(workspace.tabs[tab].root_pane);
+            }
+            workspace.active_tab = 1;
+            app.workspaces = vec![workspace];
+            app.ensure_test_terminals();
+            app.active = Some(0);
+            let states = [S::Working, S::Blocked, S::Idle];
+            for (tab_idx, pane) in panes.iter().enumerate() {
+                let terminal_id = app.workspaces[0].tabs[tab_idx].panes[pane]
+                    .attached_terminal_id
+                    .clone();
+                let terminal = app.terminals.get_mut(&terminal_id).expect("a terminal");
+                terminal.detected_agent = Some(Agent::Claude);
+                terminal.state = states[tab_idx];
+            }
+            let start = std::time::Instant::now();
+            for (offset, pane) in panes.iter().enumerate() {
+                app.work_timers.on_state_change(
+                    *pane,
+                    S::Idle,
+                    S::Working,
+                    start + std::time::Duration::from_secs(offset as u64 * 45),
+                );
+            }
+            app.work_timers.on_state_change(
+                panes[1],
+                S::Working,
+                S::Blocked,
+                start + std::time::Duration::from_secs(120),
+            );
+            app.work_clock = Some(start + std::time::Duration::from_secs(200));
+            app.system_resources = SystemResources {
+                disk_available: Some(ResourceReading {
+                    bytes: 197_895_245_824,
+                    pressure: ResourcePressure::Normal,
+                }),
+                swap_used: Some(ResourceReading {
+                    bytes: 0,
+                    pressure: ResourcePressure::Normal,
+                }),
+                disk_marker: DiskRefreshMarker::Refreshed,
+            };
+            let area = Rect::new(0, 0, width, 30);
+            dump(&format!("list selected w{width}"), &app, area, 8);
+
+            // The disk footer, from the same frame.
+            let mut terminal = Terminal::new(TestBackend::new(area.width, area.height)).unwrap();
+            terminal
+                .draw(|frame| render_sidebar(&app, &TerminalRuntimeRegistry::new(), frame, area))
+                .unwrap();
+            let buffer = terminal.backend().buffer();
+            let footer = sidebar_footer_rect(area, sidebar_footer_rows(&app));
+            for row in 0..3u16 {
+                let cells = (0..area.width)
+                    .map(|x| {
+                        let cell = &buffer[(x, footer.y + row)];
+                        format!("{}|{}|{}", cell.symbol(), color(cell.fg), color(cell.bg))
+                    })
+                    .collect::<Vec<_>>()
+                    .join("\t");
+                println!("PREVIEW\tfooter selected w{width}\t{row}\t{cells}");
+            }
+        }
     }
 
     #[test]
@@ -2333,6 +3290,7 @@ rows = [[{ token = "git_status", fg = "#123456" }]]
                 "修复🙂标题很长".into(),
             ))],
             ("", Style::default()),
+            None,
             Style::default(),
             Style::default(),
             Style::default(),
@@ -3796,7 +4754,7 @@ rows = [[{ token = "git_status", fg = "#123456" }]]
             rows[1],
             vec![
                 ResolvedToken::unstyled(ResolvedTokenKind::Agent("claude".into())),
-                ResolvedToken::unstyled(ResolvedTokenKind::StateText("error".into())),
+                ResolvedToken::unstyled(ResolvedTokenKind::StateText("err".into())),
             ]
         );
 
@@ -3813,7 +4771,7 @@ rows = [[{ token = "git_status", fg = "#123456" }]]
         let recovered = resolved_agent_rows(&app, &entry);
         assert_eq!(
             recovered[1][1],
-            ResolvedToken::unstyled(ResolvedTokenKind::StateText("working".into()))
+            ResolvedToken::unstyled(ResolvedTokenKind::StateText("run".into()))
         );
     }
 
@@ -3838,7 +4796,7 @@ rows = [[{ token = "git_status", fg = "#123456" }]]
             expanded_sidebar_sections(area, app.sidebar_section_split, sidebar_footer_rows(&app));
         let body = agent_panel_body_rect(agent_area, false);
 
-        assert_eq!(row_text(&buffer, body.y + 1, 25), "   pi · working");
+        assert_eq!(row_text(&buffer, body.y + 1, 25), "   pi · run");
     }
 
     /// Builds one workspace whose tabs carry the given names, each with an

@@ -1040,7 +1040,6 @@ fn agent_summary_segments(
                 true,
                 Some("◉"),
                 counts.blocked,
-                "blocked",
             ),
             SummaryTone::Blocked,
         ));
@@ -1053,7 +1052,6 @@ fn agent_summary_segments(
                 false,
                 Some("●"),
                 counts.done,
-                "done",
             ),
             SummaryTone::Done,
         ));
@@ -1066,21 +1064,13 @@ fn agent_summary_segments(
                 true,
                 None,
                 counts.working,
-                "working",
             ),
             SummaryTone::Working,
         ));
     }
     if counts.idle > 0 {
         segments.push((
-            agent_summary_text(
-                indicator_style,
-                AgentState::Idle,
-                true,
-                None,
-                counts.idle,
-                "idle",
-            ),
+            agent_summary_text(indicator_style, AgentState::Idle, true, None, counts.idle),
             SummaryTone::Idle,
         ));
     }
@@ -1093,12 +1083,14 @@ fn agent_summary_text(
     seen: bool,
     dot_style_symbol: Option<&str>,
     count: usize,
-    label: &str,
 ) -> String {
     let symbol = match indicator_style {
         StatusIndicatorStyle::Dots => dot_style_symbol,
         StatusIndicatorStyle::Symbols => Some(state_icon_symbol(state, seen, indicator_style)),
     };
+    // The same words the Agent rows use, from the same table, so the summary
+    // and the rows below it can never disagree about what a state is called.
+    let label = super::status::state_label(state, seen);
     match symbol {
         Some(symbol) => format!("{symbol} {count} {label}"),
         None => format!("{count} {label}"),
@@ -1283,10 +1275,7 @@ mod tests {
         };
         let segments = agent_summary_segments(counts, StatusIndicatorStyle::Dots);
         let labels: Vec<&str> = segments.iter().map(|(text, _)| text.as_str()).collect();
-        assert_eq!(
-            labels,
-            vec!["◉ 2 blocked", "● 1 done", "2 working", "1 idle"]
-        );
+        assert_eq!(labels, vec!["◉ 2 wait", "● 1 done", "2 run", "1 idle"]);
         assert_eq!(segments[0].1, SummaryTone::Blocked);
     }
 
@@ -1302,10 +1291,7 @@ mod tests {
             .into_iter()
             .map(|(text, _)| text)
             .collect();
-        assert_eq!(
-            labels,
-            ["× 2 blocked", "✓ 1 done", "◐ 2 working", "○ 1 idle"]
-        );
+        assert_eq!(labels, ["× 2 wait", "✓ 1 done", "◐ 2 run", "○ 1 idle"]);
     }
 
     #[test]
@@ -1347,10 +1333,7 @@ mod tests {
             .into_iter()
             .map(|(text, _)| text)
             .collect();
-        assert_eq!(
-            labels,
-            vec!["● 1 done".to_string(), "2 working".to_string()]
-        );
+        assert_eq!(labels, vec!["● 1 done".to_string(), "2 run".to_string()]);
     }
 
     #[test]
@@ -1378,7 +1361,7 @@ mod tests {
             24,
         );
         let labels: Vec<&str> = shown.iter().map(|(text, _)| text.as_str()).collect();
-        assert_eq!(labels, vec!["◉ 2 blocked", "● 1 done"]);
+        assert_eq!(labels, vec!["◉ 2 wait", "● 1 done"]);
         assert!(truncated);
     }
 

@@ -1471,6 +1471,13 @@ pub struct AppState {
     pub sidebar_agents: crate::config::AgentsSidebarConfig,
     pub sidebar_spaces: crate::config::SpacesSidebarConfig,
     pub sidebar_resources: crate::config::ResourcesSidebarConfig,
+    /// Working time per pane, shown beside the state word. Measured from the
+    /// state transitions themselves, so it survives redraws, selection changes
+    /// and config reloads.
+    pub(crate) work_timers: super::work_timer::WorkTimers,
+    /// Clock the sidebar reads working time against, advanced by the app's
+    /// deadline loop so rendering never reads the wall clock itself.
+    pub(crate) work_clock: Option<std::time::Instant>,
     /// Host disk and swap readings sampled off the render path and cached here,
     /// so the sidebar footer renders from data instead of querying the OS.
     pub system_resources: super::system_resources::SystemResources,
@@ -1868,6 +1875,8 @@ impl AppState {
             sidebar_agents: crate::config::AgentsSidebarConfig::default(),
             sidebar_spaces: crate::config::SpacesSidebarConfig::default(),
             sidebar_resources: crate::config::ResourcesSidebarConfig::default(),
+            work_timers: super::work_timer::WorkTimers::default(),
+            work_clock: None,
             system_resources: super::system_resources::SystemResources::default(),
             next_agent_state_change_seq: 0,
             mouse_capture: true,

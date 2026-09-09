@@ -845,9 +845,9 @@ fn cross_area_agent_process_survives_detach_and_reattach() {
     client_handshake(&mut client_b, CURRENT_PROTOCOL, 80, 24);
     let saw_working_on_client =
         wait_for_frame_matching(&mut client_b, Duration::from_secs(5), |frame| {
-            // The sidebar lifts the palette yellow toward the fluorescent
-            // end of its own hue for state markers; see `state_label_color`.
-            frame_contains_colored_symbol(frame, "●", (255, 201, 82))
+            // `working` takes the palette accent as it ships; see
+            // `state_label_color`. Catppuccin Mocha's accent is #89B4FA.
+            frame_contains_colored_symbol(frame, "●", (137, 180, 250))
         })
         .expect("frame decoding should succeed");
     assert!(
@@ -866,8 +866,10 @@ fn cross_area_agent_process_survives_detach_and_reattach() {
 
     let saw_blocked_on_client =
         wait_for_frame_matching(&mut client_b, Duration::from_secs(5), |frame| {
-            // Likewise the lifted palette red.
-            frame_contains_colored_symbol(frame, "●", (255, 92, 137))
+            // `waiting` likewise takes the palette mauve, #CBA6F7. The
+            // lifted red it used to share with `error` now belongs to
+            // `error` alone.
+            frame_contains_colored_symbol(frame, "●", (203, 166, 247))
         })
         .expect("frame decoding should succeed");
     assert!(

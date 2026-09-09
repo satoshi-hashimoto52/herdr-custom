@@ -232,25 +232,39 @@ const ERROR_ICON: &str = "!";
 
 /// Label for the five states a user reasons about.
 ///
-/// Herdr detects `Working` and `Blocked`; the sidebar keeps `working` as the
-/// word for the first and names the second for what the user is waiting on.
+/// Short words, four characters at most, because a sidebar row spends its
+/// width on the agent name and the working time and the state only has to be
+/// recognised, not read: `run` for detected `Working`, `wait` for detected
+/// `Blocked`, named for what the user is waiting on rather than for what the
+/// detector calls it. Colour and marker carry the same distinction, so the
+/// short forms lose nothing.
+///
 /// This is the displayed label only — [`pane_status_key`] still reports the
-/// state names the socket API and per-pane overrides are keyed by.
+/// state names the socket API and per-pane overrides are keyed by, and
+/// [`crate::detect::manifest::agent_state_label`] still reports the detector's
+/// own names.
 pub(super) fn state_label(state: AgentState, seen: bool) -> &'static str {
     match (state, seen) {
-        (AgentState::Blocked, _) => "waiting",
-        (AgentState::Working, _) => "working",
+        (AgentState::Blocked, _) => "wait",
+        (AgentState::Working, _) => "run",
         (AgentState::Idle, false) => "done",
         (AgentState::Idle, true) => "idle",
         (AgentState::Unknown, _) => "idle",
     }
 }
 
+/// The widest state label, in columns.
+///
+/// Every word above is ASCII and at most this many cells, so a layout that
+/// needs to reserve room for the state can do it without measuring each one.
+#[cfg(test)]
+pub(super) const MAX_STATE_LABEL_WIDTH: usize = 4;
+
 /// Pane-level label, including the `error` case that has no `AgentState` of
 /// its own because it comes from a recorded process exit rather than detection.
 pub(super) fn pane_state_label(state: AgentState, seen: bool, errored: bool) -> &'static str {
     if errored {
-        "error"
+        "err"
     } else {
         state_label(state, seen)
     }
@@ -283,7 +297,7 @@ pub(super) fn pane_state_icon(
         return (
             ERROR_ICON,
             Style::default()
-                .fg(vivid(p.red, p, BLOCKED_LIFT))
+                .fg(error_color(p))
                 .add_modifier(Modifier::BOLD),
         );
     }
@@ -298,20 +312,66 @@ pub(super) fn pane_state_label_color(
     p: &Palette,
 ) -> Color {
     if errored {
-        vivid(p.red, p, BLOCKED_LIFT)
+        error_color(p)
     } else {
         state_label_color(state, seen, p)
     }
 }
 
+/// The one table both the state word and the state marker read.
+///
+/// [`state_icon`] takes its color from here, and [`pane_state_label_color`]
+/// and [`pane_state_icon`] both take the `error` case from [`error_color`], so
+/// a word and the dot beside it cannot drift apart.
 pub(super) fn state_label_color(state: AgentState, seen: bool, p: &Palette) -> Color {
+    let (working, waiting) = attention_colors(p);
     match (state, seen) {
-        (AgentState::Blocked, _) => vivid(p.red, p, BLOCKED_LIFT),
-        (AgentState::Working, _) => vivid(p.yellow, p, WORKING_LIFT),
+        (AgentState::Blocked, _) => waiting,
+        (AgentState::Working, _) => working,
         (AgentState::Idle, false) => vivid(p.teal, p, DONE_LIFT),
         (AgentState::Idle, true) => vivid(p.green, p, IDLE_LIFT),
         (AgentState::Unknown, _) => vivid(p.overlay0, p, UNKNOWN_LIFT),
     }
+}
+
+/// Colors for the two states an agent passes through mid-turn.
+///
+/// `working` and `waiting` take a palette token as it ships rather than a lift
+/// of one. The tab accent is a warm orange, and a lifted yellow `working` sat
+/// close enough to it that a project name and a state word stopped being
+/// separable at a glance; the accent blue and mauve put both states clear of
+/// it and of each other. Taking tokens rather than fixed hex means a theme
+/// still colors its own states.
+///
+/// Two kinds of palette cannot supply them and keep the lifted hues these
+/// states used before:
+///
+/// * one built from ANSI color names, where `mauve` is a plain gray and would
+///   say nothing about a row that is waiting on a person;
+/// * one that ships the same color, or near enough, for both tokens
+///   (rose-pine, vesper), where two states would become one color.
+fn attention_colors(p: &Palette) -> (Color, Color) {
+    if let (Color::Rgb(ar, ag, ab), Color::Rgb(mr, mg, mb)) = (p.accent, p.mauve) {
+        let (accent_hue, ..) = rgb_to_hsl((ar, ag, ab));
+        let (mauve_hue, ..) = rgb_to_hsl((mr, mg, mb));
+        let apart = (accent_hue - mauve_hue).abs();
+        if apart.min(360.0 - apart) >= MIN_ATTENTION_HUE_GAP {
+            return (p.accent, p.mauve);
+        }
+    }
+    (
+        vivid(p.yellow, p, WORKING_LIFT),
+        vivid(p.red, p, BLOCKED_LIFT),
+    )
+}
+
+/// Color for a pane whose agent died mid-turn.
+///
+/// The palette red at the lift `waiting` used before it moved to mauve, so
+/// `error` remains the one state that raises its voice — and, in a palette
+/// that falls back, the state it shared a color with all along.
+fn error_color(p: &Palette) -> Color {
+    vivid(p.red, p, BLOCKED_LIFT)
 }
 
 /// Accent for the tab name — the word that says which project a row belongs to.
@@ -339,11 +399,22 @@ type Lift = (f32, f32);
 /// Attention states run hot and bright; `idle` is lifted least, so a sidebar
 /// full of finished agents stays quiet and the one that needs a person does
 /// not.
+///
+/// `BLOCKED_LIFT` and `WORKING_LIFT` now serve `error` and the palettes that
+/// cannot supply [`attention_colors`]; `working` and `waiting` themselves take
+/// their token unlifted.
 const BLOCKED_LIFT: Lift = (1.0, 0.68);
 const WORKING_LIFT: Lift = (1.0, 0.66);
 const DONE_LIFT: Lift = (1.0, 0.62);
 const IDLE_LIFT: Lift = (0.75, 0.70);
 const UNKNOWN_LIFT: Lift = (0.18, 0.63);
+
+/// How far apart `accent` and `mauve` must sit before they can carry two
+/// different states.
+///
+/// Every shipped theme is either under 4 degrees apart or over 35, so the
+/// exact figure is not delicate.
+const MIN_ATTENTION_HUE_GAP: f32 = 20.0;
 
 /// The tab-name accent, held apart from the state hues so a project name and a
 /// state label never read as the same color on neighbouring rows.
@@ -529,19 +600,38 @@ mod tests {
     #[test]
     fn state_labels_name_the_five_states_a_user_reasons_about() {
         let cases = [
-            (AgentState::Working, true, false, "working"),
-            (AgentState::Blocked, true, false, "waiting"),
+            (AgentState::Working, true, false, "run"),
+            (AgentState::Blocked, true, false, "wait"),
             (AgentState::Idle, false, false, "done"),
             (AgentState::Idle, true, false, "idle"),
             (AgentState::Unknown, true, false, "idle"),
             // A recorded mid-turn exit outranks whatever detection last saw.
-            (AgentState::Working, true, true, "error"),
-            (AgentState::Idle, true, true, "error"),
+            (AgentState::Working, true, true, "err"),
+            (AgentState::Idle, true, true, "err"),
         ];
 
         for (state, seen, errored, expected) in cases {
             assert_eq!(pane_state_label(state, seen, errored), expected);
+            assert!(
+                display_width_u16(expected) as usize <= MAX_STATE_LABEL_WIDTH,
+                "{expected:?} is wider than a row reserves for a state"
+            );
         }
+
+        // The detector's own names, and the keys the socket API and per-pane
+        // label overrides are addressed by, are untouched by the short forms.
+        assert_eq!(
+            crate::detect::manifest::agent_state_label(AgentState::Working),
+            "working"
+        );
+        assert_eq!(
+            crate::detect::manifest::agent_state_label(AgentState::Blocked),
+            "blocked"
+        );
+        assert_eq!(pane_status_key(AgentState::Working, true, false), "working");
+        assert_eq!(pane_status_key(AgentState::Blocked, true, false), "blocked");
+        assert_eq!(pane_status_key(AgentState::Idle, false, false), "done");
+        assert_eq!(pane_status_key(AgentState::Idle, true, true), "error");
     }
 
     fn hue_of(color: Color) -> f32 {
@@ -561,9 +651,9 @@ mod tests {
     #[test]
     fn state_colors_are_lifted_without_moving_off_their_hue() {
         let palette = Palette::catppuccin();
+        // `working` and `waiting` take their token as it ships; the rest are
+        // lifted, and a lift may brighten a color but never move its hue.
         let cases = [
-            (AgentState::Blocked, true, palette.red),
-            (AgentState::Working, true, palette.yellow),
             (AgentState::Idle, false, palette.teal),
             (AgentState::Idle, true, palette.green),
             (AgentState::Unknown, true, palette.overlay0),
@@ -584,8 +674,110 @@ mod tests {
         // `idle` is the one state deliberately left quieter than the rest, so a
         // sidebar full of finished agents does not shout.
         let idle = saturation_of(state_label_color(AgentState::Idle, true, &palette));
-        let blocked = saturation_of(state_label_color(AgentState::Blocked, true, &palette));
-        assert!(idle < blocked);
+        let waiting = saturation_of(state_label_color(AgentState::Blocked, true, &palette));
+        assert!(idle < waiting);
+    }
+
+    #[test]
+    fn working_and_waiting_are_the_accent_and_mauve_the_theme_ships() {
+        let palette = Palette::catppuccin();
+        assert_eq!(
+            state_label_color(AgentState::Working, true, &palette),
+            palette.accent,
+            "working takes the accent token, not a lift of it"
+        );
+        assert_eq!(
+            state_label_color(AgentState::Blocked, true, &palette),
+            palette.mauve
+        );
+        // The values those tokens carry in the default theme.
+        assert_eq!(
+            state_label_color(AgentState::Working, true, &palette),
+            Color::Rgb(0x89, 0xb4, 0xfa)
+        );
+        assert_eq!(
+            state_label_color(AgentState::Blocked, true, &palette),
+            Color::Rgb(0xcb, 0xa6, 0xf7)
+        );
+
+        // The states left alone keep exactly the colors they had.
+        assert_eq!(
+            state_label_color(AgentState::Idle, true, &palette),
+            Color::Rgb(0x82, 0xec, 0x79),
+            "idle"
+        );
+        assert_eq!(
+            state_label_color(AgentState::Idle, false, &palette),
+            Color::Rgb(0x3d, 0xff, 0xdf),
+            "done"
+        );
+        assert_eq!(
+            pane_state_label_color(AgentState::Idle, false, true, &palette),
+            Color::Rgb(0xff, 0x5c, 0x89),
+            "error"
+        );
+    }
+
+    #[test]
+    fn the_word_and_the_dot_beside_it_are_always_the_same_color() {
+        let palette = Palette::catppuccin();
+        for (state, seen, errored) in [
+            (AgentState::Idle, true, false),
+            (AgentState::Working, true, false),
+            (AgentState::Blocked, true, false),
+            (AgentState::Idle, false, false),
+            (AgentState::Working, true, true),
+        ] {
+            let (_, icon) =
+                pane_state_icon(state, seen, errored, StatusIndicatorStyle::Dots, &palette);
+            assert_eq!(
+                icon.fg,
+                Some(pane_state_label_color(state, seen, errored, &palette)),
+                "{state:?} seen={seen} errored={errored}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_theme_that_cannot_tell_its_two_tokens_apart_keeps_the_old_hues() {
+        // rose-pine ships one color for both `accent` and `mauve`, and vesper
+        // two that sit three degrees apart. Either would leave `working` and
+        // `waiting` looking like one state, so both fall back.
+        for palette in [
+            Palette::rose_pine(),
+            Palette::rose_pine_dawn(),
+            Palette::vesper(),
+            // ANSI names: `mauve` is a plain gray, which would say nothing
+            // about a row that is waiting on a person.
+            Palette::terminal(),
+        ] {
+            let working = state_label_color(AgentState::Working, true, &palette);
+            let waiting = state_label_color(AgentState::Blocked, true, &palette);
+            assert_ne!(working, waiting, "two states, one color");
+            assert_eq!(working, vivid(palette.yellow, &palette, WORKING_LIFT));
+            assert_eq!(waiting, vivid(palette.red, &palette, BLOCKED_LIFT));
+        }
+
+        // Every other shipped theme has tokens far enough apart to use them.
+        for palette in [
+            Palette::catppuccin(),
+            Palette::tokyo_night(),
+            Palette::dracula(),
+            Palette::nord(),
+            Palette::gruvbox(),
+            Palette::one_dark(),
+            Palette::solarized(),
+            Palette::kanagawa(),
+        ] {
+            assert_eq!(
+                state_label_color(AgentState::Working, true, &palette),
+                palette.accent
+            );
+            assert_eq!(
+                state_label_color(AgentState::Blocked, true, &palette),
+                palette.mauve
+            );
+        }
     }
 
     #[test]
@@ -613,10 +805,20 @@ mod tests {
 
     #[test]
     fn light_and_terminal_palettes_keep_their_own_state_colors() {
+        // A light palette is never lifted, but it still colors `working` and
+        // `waiting` from its own accent and mauve.
         let latte = Palette::catppuccin_latte();
         assert_eq!(
             state_label_color(AgentState::Working, true, &latte),
-            latte.yellow
+            latte.accent
+        );
+        assert_eq!(
+            state_label_color(AgentState::Blocked, true, &latte),
+            latte.mauve
+        );
+        assert_eq!(
+            state_label_color(AgentState::Idle, false, &latte),
+            latte.teal
         );
         assert_eq!(project_label_color(&latte), latte.peach);
 
@@ -625,6 +827,11 @@ mod tests {
         assert_eq!(
             state_label_color(AgentState::Working, true, &terminal),
             terminal.yellow
+        );
+        assert_eq!(
+            state_label_color(AgentState::Blocked, true, &terminal),
+            terminal.red,
+            "an ANSI palette must not put a gray on a row waiting for a person"
         );
     }
 
@@ -668,7 +875,9 @@ mod tests {
         assert_eq!(display_width_u16(symbol), 1);
         assert_eq!(style.fg, Some(errored_red));
         assert!(style.add_modifier.contains(Modifier::BOLD));
-        assert_eq!(
+        assert_eq!(errored_red, vivid(palette.red, &palette, BLOCKED_LIFT));
+        // `waiting` moved to mauve, so the red now belongs to `error` alone.
+        assert_ne!(
             errored_red,
             state_label_color(AgentState::Blocked, true, &palette)
         );

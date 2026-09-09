@@ -387,6 +387,7 @@ impl App {
         changed |= self.expire_due_metadata(now);
         changed |= self.handle_tab_bar_status_tasks(now);
         changed |= self.handle_system_resource_refresh(now);
+        changed |= self.handle_work_timer_tick(now);
 
         if geometry_dirty || resized {
             self.pending_agent_resume_deadline = None;
@@ -602,7 +603,8 @@ impl App {
         needs_render: bool,
         include_resize_poll: bool,
         // Gates refreshes that only matter while a client is watching the UI:
-        // sidebar Git status, and the sidebar's host resource footer.
+        // sidebar Git status, the sidebar's host resource footer, and the
+        // ticking working time on Agent rows.
         include_client_visible_refresh: bool,
     ) -> Option<Instant> {
         let render_deadline = if needs_render {
@@ -633,6 +635,9 @@ impl App {
             self.next_tab_bar_status_deadline(),
             include_client_visible_refresh
                 .then(|| self.next_system_resource_deadline())
+                .flatten(),
+            include_client_visible_refresh
+                .then(|| self.next_work_timer_deadline())
                 .flatten(),
             render_deadline,
         ]
