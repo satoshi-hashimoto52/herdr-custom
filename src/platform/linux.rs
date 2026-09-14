@@ -8,8 +8,8 @@ use std::{
 };
 
 use super::{
-    read_limited_reader, ClipboardCommand, ClipboardImage, ForegroundJob, ForegroundProcess,
-    LimitedRead, Signal, SystemResourceSample,
+    read_limited_reader, ClipboardCommand, ClipboardImage, CpuTicks, ForegroundJob,
+    ForegroundProcess, LimitedRead, MemoryUsage, Signal, SystemResourceSample,
 };
 
 pub(crate) use super::unix_common::{
@@ -749,14 +749,70 @@ fn process_session_id(pid: u32) -> Option<i32> {
     fields.get(3)?.parse().ok()
 }
 
-/// Reads host disk and swap pressure through `statvfs` and `/proc/meminfo`.
+/// Reads host resource pressure through `statvfs`, `/proc/meminfo` and
+/// `/proc/stat`.
 pub fn system_resource_sample() -> SystemResourceSample {
+    let meminfo = std::fs::read_to_string("/proc/meminfo").unwrap_or_default();
     SystemResourceSample {
         disk_available_bytes: available_disk_bytes(std::path::Path::new("/")),
-        swap_used_bytes: swap_used_bytes_from_meminfo(
-            &std::fs::read_to_string("/proc/meminfo").unwrap_or_default(),
+        swap_used_bytes: swap_used_bytes_from_meminfo(&meminfo),
+        cpu_ticks: cpu_ticks_from_proc_stat(
+            &std::fs::read_to_string("/proc/stat").unwrap_or_default(),
         ),
+        memory: memory_usage_from_meminfo(&meminfo),
     }
+}
+
+/// Cumulative CPU time from the aggregate `cpu` line of `/proc/stat`.
+///
+/// That first line is already the sum over every logical CPU, so the ratio of
+/// two readings is the whole machine's load rather than one core's. Every
+/// field except `idle` and `iowait` counts as busy, matching what `top` and
+/// `vmstat` treat as utilisation.
+fn cpu_ticks_from_proc_stat(stat: &str) -> Option<CpuTicks> {
+    let line = stat.lines().find(|line| {
+        line.strip_prefix("cpu")
+            .is_some_and(|rest| rest.starts_with(char::is_whitespace))
+    })?;
+    let fields: Vec<u64> = line
+        .split_whitespace()
+        .skip(1)
+        .filter_map(|field| field.parse().ok())
+        .collect();
+    // user, nice, system, idle at minimum; iowait onwards may be absent on
+    // very old kernels.
+    if fields.len() < 4 {
+        return None;
+    }
+    let total: u64 = fields.iter().copied().sum();
+    let idle = fields[3] + fields.get(4).copied().unwrap_or(0);
+    Some(CpuTicks {
+        busy: total.saturating_sub(idle),
+        total,
+    })
+}
+
+/// Physical memory in use and installed, from `/proc/meminfo`.
+///
+/// `used` is `MemTotal - MemAvailable`. `MemAvailable` is the kernel's own
+/// estimate of what a new allocation could obtain without swapping, so it
+/// already excludes reclaimable page cache — which is why this is used rather
+/// than `MemTotal - MemFree`, a figure that counts cache as used and reads as
+/// though the machine were permanently full.
+fn memory_usage_from_meminfo(meminfo: &str) -> Option<MemoryUsage> {
+    let field = |key: &str| {
+        meminfo
+            .lines()
+            .find_map(|line| line.strip_prefix(key)?.trim().strip_suffix("kB"))
+            .and_then(|value| value.trim().parse::<u64>().ok())
+            .and_then(|kib| kib.checked_mul(1024))
+    };
+    let total_bytes = field("MemTotal:")?;
+    let available = field("MemAvailable:")?;
+    Some(MemoryUsage {
+        used_bytes: total_bytes.saturating_sub(available),
+        total_bytes,
+    })
 }
 
 /// Space available to an unprivileged process, matching `df`.
@@ -796,6 +852,44 @@ mod tests {
     fn env_lock() -> &'static Mutex<()> {
         static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
         LOCK.get_or_init(|| Mutex::new(()))
+    }
+
+    #[test]
+    fn cpu_ticks_sum_the_aggregate_line_of_proc_stat() {
+        let stat = "cpu  100 20 30 700 40 0 10 0 0 0\ncpu0 50 10 15 350 20 0 5 0 0 0\nintr 1234\n";
+        let ticks = cpu_ticks_from_proc_stat(stat).expect("aggregate line");
+        // Every field counts toward the total; idle and iowait are the two
+        // that are not busy.
+        assert_eq!(ticks.total, 900);
+        assert_eq!(ticks.busy, 900 - 700 - 40);
+        assert!(ticks.busy <= ticks.total);
+    }
+
+    #[test]
+    fn cpu_ticks_tolerate_a_short_or_missing_line() {
+        // A kernel old enough to omit iowait still reports the four it must.
+        let ticks = cpu_ticks_from_proc_stat("cpu 10 0 10 80\n").expect("aggregate line");
+        assert_eq!(ticks.total, 100);
+        assert_eq!(ticks.busy, 20);
+
+        assert_eq!(cpu_ticks_from_proc_stat(""), None);
+        assert_eq!(cpu_ticks_from_proc_stat("cpu 1 2\n"), None);
+        // `cpu0` is a per-core line, not the aggregate one.
+        assert_eq!(cpu_ticks_from_proc_stat("cpu0 1 2 3 4\n"), None);
+    }
+
+    #[test]
+    fn memory_used_excludes_the_cache_the_kernel_can_reclaim() {
+        let meminfo = "MemTotal:       16384000 kB\nMemFree:          512000 kB\nMemAvailable:    8192000 kB\nCached:          6000000 kB\n";
+        let usage = memory_usage_from_meminfo(meminfo).expect("both fields");
+        assert_eq!(usage.total_bytes, 16_384_000 * 1024);
+        // `MemTotal - MemAvailable`, not `MemTotal - MemFree`: the cache is
+        // memory the kernel would hand back, not memory that is spoken for.
+        assert_eq!(usage.used_bytes, (16_384_000 - 8_192_000) * 1024);
+        assert!(usage.used_bytes <= usage.total_bytes);
+
+        assert_eq!(memory_usage_from_meminfo("MemTotal: 100 kB\n"), None);
+        assert_eq!(memory_usage_from_meminfo(""), None);
     }
 
     #[test]

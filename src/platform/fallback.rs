@@ -221,7 +221,9 @@ pub fn show_desktop_notification(_title: &str, _body: Option<&str>) -> std::io::
     Ok(false)
 }
 
-/// Unsupported platforms report no readings so the sidebar footer stays hidden.
+/// Unsupported platforms report no readings at all — disk, swap, CPU and
+/// memory alike — so the sidebar footer stays hidden rather than inventing a
+/// zero for any of them.
 pub fn system_resource_sample() -> SystemResourceSample {
     SystemResourceSample::default()
 }

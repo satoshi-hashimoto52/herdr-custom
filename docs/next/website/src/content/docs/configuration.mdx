@@ -429,10 +429,12 @@ Sidebar row settings affect only the expanded desktop sidebar. Collapsed and mob
 
 ### Sidebar resource footer
 
-The expanded desktop sidebar pins free disk space and swap use to its bottom rows, below the Agents list, so the Agents list scrolls while the readings stay visible:
+The expanded desktop sidebar pins four host readings to its bottom rows, below the Agents list, so the Agents list scrolls while the readings stay visible:
 
 ```text
 ────────────────
+CPU   14%
+RAM   9.8/16 GB
 SSD   198 GB
 SWAP  0.0 GB
 ```
@@ -442,9 +444,17 @@ SWAP  0.0 GB
 enabled = true
 ```
 
-Readings come from OS APIs rather than shelled-out commands: `statfs` on the APFS Data volume plus `vm.swapusage` on macOS, and `statvfs` with `/proc/meminfo` on Linux. Free space is `f_bavail` — the space an unprivileged process can actually claim, the same figure `df` reports. It need not match what Finder and System Settings show, because those add reclaimable purgeable space to their total. Values are in decimal gigabytes.
+Readings come from OS APIs rather than shelled-out commands. On macOS that is `statfs` on the APFS Data volume, `vm.swapusage`, `HOST_CPU_LOAD_INFO`, and the mach virtual-memory statistics with `hw.memsize`; on Linux, `statvfs` with `/proc/meminfo` and `/proc/stat`. Nothing spawns a process, on any beat. Windows has no readout yet and hides the footer rather than showing a fabricated zero; so does any other platform.
 
-Free space is read once at startup and every 30 seconds after that. Swap keeps its own four-second beat. Either way sampling runs only while the expanded sidebar is on screen — a collapsed sidebar, the mobile layout, and `enabled = false` all stop it. A reading holds still when it has not changed, so the footer does not flicker.
+`CPU` is the whole machine, not one core: the kernel counters behind it are already summed over every logical CPU, so a fully loaded eight-core Mac reads 100%, not 800%. It is the busy share of the time that passed between two samples, rounded to a whole percent, and it shows `--` until a second sample exists to measure against the first.
+
+`RAM` is memory in use over memory installed. In use means what Activity Monitor calls Memory Used — app memory, wired, and compressed — and on Linux `MemTotal - MemAvailable`. Reclaimable file cache is deliberately left out: a plain `total - free` counts the cache as spoken for and reads as though the machine were permanently full. Memory is shown in binary gigabytes, the unit every operating system reports it in, so a machine sold as 16 GB reads `16` rather than the 17.2 its decimal size would give. Disk and swap stay in decimal gigabytes, which is how storage is sold and how `df` reports it.
+
+Free space is `f_bavail` — the space an unprivileged process can actually claim, the same figure `df` reports. It need not match what Finder and System Settings show, because those add reclaimable purgeable space to their total.
+
+The readings keep separate cadences: CPU and memory are re-read every three seconds, swap every four, and free space once at startup and every 30 seconds after that. Sampling runs only while the expanded sidebar is on screen — a collapsed sidebar, the mobile layout, and `enabled = false` all stop it. A reading holds still when it has not changed, so the footer does not flicker. There is nothing new to configure: the CPU and memory rows add no settings of their own.
+
+A reading the host could not answer shows `--` rather than the last value it managed. Disk and swap instead keep their last good number and say so with the marker below, because a stale free-space figure is still true, just not current.
 
 The free-space row marks its own refreshes:
 
@@ -454,7 +464,9 @@ SSD   198 GB !   the last read failed
 SSD   198 GB     steady state
 ```
 
-The green `✓` stays up for five seconds after a successful read, including a read that returns the same number, and a second success inside those five seconds restarts them. A failed read keeps the last good value and shows a yellow `!` until a read succeeds, at which point the `!` becomes a fresh `✓`. Before the first successful read there is no value to qualify, so the row stays hidden rather than showing a bare marker.
+The green `✓` stays up for five seconds after a successful read, including a read that returns the same number, and a second success inside those five seconds restarts them. A failed read keeps the last good value and shows a yellow `!` until a read succeeds, at which point the `!` becomes a fresh `✓`. Before the first successful read there is no value to qualify, so the row stays hidden rather than showing a bare marker. The marker belongs to free space alone — CPU and memory change constantly, so marking every change would leave the footer blinking for no gain, and neither row is coloured by how high it reads either.
+
+A short sidebar gives up CPU and memory *together*, falling back to the free-space and swap rows it has always had, and a sidebar too short for those two hides the footer entirely and gives the rows back to the Agents list. One of the pair alone would read as a rendering fault, and the Agents list is what the sidebar is for. A sidebar too narrow to print the memory row whole does the same thing rather than cutting a number in half.
 
 Free space reads muted above 50 GB, yellow from 30 to 50 GB, peach from 20 to 30 GB, and bold red below 20 GB. Swap reads muted below 5 GB, yellow from 5 to 10 GB, and peach above that. Swap stays visible at `0.0 GB`. A narrow sidebar abbreviates the readings to `198G` and `0.0G`, and drops the refresh marker before it would cost the number a digit; a sidebar too short to spare three rows hides the footer and keeps its sections. Platforms without a supported query hide the footer instead of reporting a zero.
 

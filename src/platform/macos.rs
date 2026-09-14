@@ -8,8 +8,8 @@ use std::ptr::NonNull;
 use std::sync::OnceLock;
 
 use super::{
-    read_limited_reader, ClipboardCommand, ClipboardImage, ForegroundJob, ForegroundProcess,
-    LimitedRead, Signal, SystemResourceSample,
+    read_limited_reader, ClipboardCommand, ClipboardImage, CpuTicks, ForegroundJob,
+    ForegroundProcess, LimitedRead, MemoryUsage, Signal, SystemResourceSample,
 };
 
 pub(crate) use super::unix_common::{
@@ -1010,7 +1010,117 @@ pub fn system_resource_sample() -> SystemResourceSample {
         disk_available_bytes: available_disk_bytes(Path::new(DATA_VOLUME_PATH))
             .or_else(|| available_disk_bytes(Path::new("/"))),
         swap_used_bytes: swap_used_bytes(),
+        cpu_ticks: cpu_ticks(),
+        memory: memory_usage(),
     }
+}
+
+/// Cumulative CPU time for the whole machine, from `HOST_CPU_LOAD_INFO`.
+///
+/// The kernel already sums these counters over every logical CPU, so the
+/// ratio of two readings is the machine's load with all cores at 100% rather
+/// than one core's. Ticks are 32-bit and do wrap; the caller compares two
+/// readings and discards a difference that runs backwards.
+// `libc::mach_host_self` is marked deprecated in favour of the `mach2` crate.
+// The symbol itself is not going anywhere — it is the documented way to get
+// the host port — and pulling in a whole crate for one call is not worth it,
+// so the deprecation is allowed here rather than answered with a dependency.
+#[allow(deprecated)]
+fn cpu_ticks() -> Option<CpuTicks> {
+    let mut info = std::mem::MaybeUninit::<libc::host_cpu_load_info>::uninit();
+    let mut count = libc::HOST_CPU_LOAD_INFO_COUNT;
+    // SAFETY: `info` is a correctly sized `host_cpu_load_info` allocation and
+    // `count` is the element count the flavor expects, both as the call
+    // requires. `mach_host_self` returns a send right that needs no release.
+    let result = unsafe {
+        libc::host_statistics(
+            libc::mach_host_self(),
+            libc::HOST_CPU_LOAD_INFO,
+            info.as_mut_ptr().cast::<libc::integer_t>(),
+            &mut count,
+        )
+    };
+    if result != libc::KERN_SUCCESS {
+        return None;
+    }
+    // SAFETY: the call succeeded and filled the buffer.
+    let ticks = unsafe { info.assume_init() }.cpu_ticks;
+    let at = |state: libc::c_int| u64::from(ticks[state as usize]);
+    let idle = at(libc::CPU_STATE_IDLE);
+    let busy = at(libc::CPU_STATE_USER) + at(libc::CPU_STATE_SYSTEM) + at(libc::CPU_STATE_NICE);
+    Some(CpuTicks {
+        busy,
+        total: busy + idle,
+    })
+}
+
+/// Physical memory in use and installed.
+///
+/// `used` is app memory, wired, and compressed — the three parts Activity
+/// Monitor adds up for Memory Used. App memory is `internal_page_count` less
+/// the purgeable pages the kernel can drop under pressure. File-backed cache
+/// (`external_page_count`) is left out on purpose: it is memory the system is
+/// using well, not memory that is spoken for.
+// `libc::mach_host_self` is marked deprecated in favour of the `mach2` crate.
+// The symbol itself is not going anywhere — it is the documented way to get
+// the host port — and pulling in a whole crate for one call is not worth it,
+// so the deprecation is allowed here rather than answered with a dependency.
+#[allow(deprecated)]
+fn memory_usage() -> Option<MemoryUsage> {
+    let mut stats = std::mem::MaybeUninit::<libc::vm_statistics64>::uninit();
+    let mut count = libc::HOST_VM_INFO64_COUNT;
+    // SAFETY: `stats` is a correctly sized `vm_statistics64` allocation and
+    // `count` is the element count the flavor expects.
+    let result = unsafe {
+        libc::host_statistics64(
+            libc::mach_host_self(),
+            libc::HOST_VM_INFO64,
+            stats.as_mut_ptr().cast::<libc::integer_t>(),
+            &mut count,
+        )
+    };
+    if result != libc::KERN_SUCCESS {
+        return None;
+    }
+    // SAFETY: the call succeeded and filled the buffer.
+    let stats = unsafe { stats.assume_init() };
+    // SAFETY: reading an initialized global the dynamic linker sets up.
+    let page_size = unsafe { libc::vm_page_size } as u64;
+
+    let app = u64::from(stats.internal_page_count).saturating_sub(u64::from(stats.purgeable_count));
+    let pages = app
+        .saturating_add(u64::from(stats.wire_count))
+        .saturating_add(u64::from(stats.compressor_page_count));
+    let total_bytes = physical_memory_bytes()?;
+    Some(MemoryUsage {
+        // A reading can only ever be as large as the machine: the three page
+        // counts are sampled separately and could in principle add up past
+        // `hw.memsize` between them.
+        used_bytes: pages.saturating_mul(page_size).min(total_bytes),
+        total_bytes,
+    })
+}
+
+/// Installed physical memory, from `hw.memsize`.
+fn physical_memory_bytes() -> Option<u64> {
+    let name = std::ffi::CString::new("hw.memsize").ok()?;
+    let mut bytes: u64 = 0;
+    let mut len = std::mem::size_of::<u64>();
+    // SAFETY: `name` is a valid NUL-terminated sysctl name and `bytes` is a
+    // `u64` matching the advertised `len`.
+    let result = unsafe {
+        libc::sysctlbyname(
+            name.as_ptr(),
+            std::ptr::from_mut(&mut bytes).cast::<libc::c_void>(),
+            &mut len,
+            std::ptr::null_mut(),
+            0,
+        )
+    };
+    if result != 0 || len != std::mem::size_of::<u64>() || bytes == 0 {
+        return None;
+    }
+    Some(bytes)
 }
 
 /// Space available to an unprivileged process, matching `df` rather than Finder.
@@ -1290,10 +1400,79 @@ printf '%s\n' "$@" > "$HERDR_NOTIFY_ARGS"
     }
 
     #[test]
-    fn system_resource_sample_reports_both_readings() {
+    fn system_resource_sample_reports_every_reading() {
         let sample = system_resource_sample();
 
         assert!(sample.disk_available_bytes.is_some_and(|bytes| bytes > 0));
         assert!(sample.swap_used_bytes.is_some());
+
+        let ticks = sample.cpu_ticks.expect("cpu counters");
+        assert!(ticks.total > 0);
+        assert!(ticks.busy <= ticks.total, "{ticks:?}");
+
+        let memory = sample.memory.expect("memory reading");
+        assert!(memory.total_bytes > 0);
+        assert!(memory.used_bytes > 0);
+        assert!(memory.used_bytes <= memory.total_bytes, "{memory:?}");
+        // `hw.memsize` is the installed amount, which is always a whole number
+        // of binary gigabytes on real hardware.
+        assert_eq!(memory.total_bytes % (1024 * 1024 * 1024), 0, "{memory:?}");
+    }
+
+    #[test]
+    fn cpu_counters_advance_between_two_reads() {
+        // Cumulative counters: the second read is never behind the first, and
+        // on a machine that is doing anything at all it moves forward.
+        let first = cpu_ticks().expect("cpu counters");
+        let mut spin = 0u64;
+        for i in 0..2_000_000u64 {
+            spin = spin.wrapping_add(i);
+        }
+        assert!(spin > 0);
+        let second = cpu_ticks().expect("cpu counters");
+        assert!(second.total >= first.total, "{first:?} -> {second:?}");
+        assert!(second.busy >= first.busy, "{first:?} -> {second:?}");
+    }
+
+    /// Times one whole sample, to show the three-second beat costs nothing.
+    #[test]
+    #[ignore = "prints a timing rather than asserting"]
+    fn host_reading_cost_probe() {
+        let runs = 10_000;
+        let start = std::time::Instant::now();
+        for _ in 0..runs {
+            std::hint::black_box(system_resource_sample());
+        }
+        let each = start.elapsed() / runs;
+        println!("PROBE one full sample: {each:?}");
+        let start = std::time::Instant::now();
+        for _ in 0..runs {
+            std::hint::black_box(cpu_ticks());
+            std::hint::black_box(memory_usage());
+        }
+        println!("PROBE cpu+memory only: {:?}", start.elapsed() / runs);
+    }
+
+    /// Prints the live readings, for checking them against Activity Monitor.
+    #[test]
+    #[ignore = "prints live host readings rather than asserting"]
+    fn host_reading_probe() {
+        let sample = system_resource_sample();
+        let gib = 1_073_741_824f64;
+        let memory = sample.memory.expect("memory reading");
+        println!(
+            "PROBE memory used={:.2} GiB total={:.2} GiB",
+            memory.used_bytes as f64 / gib,
+            memory.total_bytes as f64 / gib
+        );
+        let first = cpu_ticks().expect("cpu counters");
+        std::thread::sleep(std::time::Duration::from_millis(500));
+        let second = cpu_ticks().expect("cpu counters");
+        let busy = second.busy - first.busy;
+        let total = second.total - first.total;
+        println!(
+            "PROBE cpu busy={busy} total={total} percent={:.1}",
+            100.0 * busy as f64 / total as f64
+        );
     }
 }

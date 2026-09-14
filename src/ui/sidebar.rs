@@ -16,7 +16,7 @@ use super::status::{
 };
 use super::text::{display_width, display_width_u16, truncate_end};
 use crate::app::state::{AgentPanelSort, Palette};
-use crate::app::system_resources::{DiskRefreshMarker, ResourcePressure};
+use crate::app::system_resources::{DiskRefreshMarker, MemoryReading, ResourcePressure};
 use crate::app::{AppState, Mode};
 use crate::detect::AgentState;
 use crate::terminal::TerminalRuntimeRegistry;
@@ -62,9 +62,16 @@ fn sidebar_section_heights(total_h: u16, split_ratio: f32) -> (u16, u16) {
     (ws_h, detail_h)
 }
 
-/// Rows the pinned resource footer claims: a divider plus one line each for
-/// disk and swap.
+/// Rows the pinned resource footer claims at its smallest: a divider plus one
+/// line each for disk and swap.
 const SIDEBAR_FOOTER_ROWS: u16 = 3;
+
+/// Rows the footer claims when it can also show CPU and memory: the same
+/// divider plus four readings.
+///
+/// CPU and memory are the pair that gives way first. They are the two a person
+/// can get from anywhere else, and the Agents list is what the sidebar is for.
+const SIDEBAR_FOOTER_EXTENDED_ROWS: u16 = 5;
 
 /// Rows the Spaces and Agents sections keep before the footer may claim any,
 /// matching the floor `sidebar_section_heights` already enforces.
@@ -81,28 +88,46 @@ fn sidebar_sections_height(content: Rect, footer_rows: u16) -> u16 {
         .saturating_sub(fitted_footer_rows(content, footer_rows))
 }
 
-/// Footer rows that actually fit, all or nothing.
+/// Footer rows that actually fit, in whole readouts.
 ///
-/// A partial footer would show a divider with one reading under it, and a
-/// sidebar narrower than the abbreviated form could only cut a number
-/// mid-digit. Either way the rows go back to the sections instead.
+/// Three outcomes, never a partial one: all four readings, disk and swap
+/// alone, or nothing. A footer too short or too narrow for CPU and memory
+/// gives up *both* of them rather than leaving one behind — half the pair
+/// would read as a rendering fault — and a footer that cannot hold disk and
+/// swap either gives its rows back to the sections.
 fn fitted_footer_rows(content: Rect, footer_rows: u16) -> u16 {
-    let fits = footer_rows > 0
-        && content.height >= MIN_SIDEBAR_SECTION_ROWS.saturating_add(footer_rows)
-        && content.width.saturating_sub(1) >= FOOTER_MIN_WIDTH;
-    if fits {
-        footer_rows
+    if footer_rows == 0 {
+        return 0;
+    }
+    let text_width = content.width.saturating_sub(1);
+    let fits = |rows: u16, min_width: u16| {
+        content.height >= MIN_SIDEBAR_SECTION_ROWS.saturating_add(rows) && text_width >= min_width
+    };
+    if footer_rows >= SIDEBAR_FOOTER_EXTENDED_ROWS
+        && fits(SIDEBAR_FOOTER_EXTENDED_ROWS, FOOTER_EXTENDED_MIN_WIDTH)
+    {
+        return SIDEBAR_FOOTER_EXTENDED_ROWS;
+    }
+    if fits(SIDEBAR_FOOTER_ROWS, FOOTER_MIN_WIDTH) {
+        SIDEBAR_FOOTER_ROWS
     } else {
         0
     }
 }
 
 /// Rows the footer wants, or zero when it is off or has nothing to report.
+///
+/// This is the one place the row count is decided. Rendering, hit testing,
+/// scrolling and the section split all read it, so the Agents list can never
+/// disagree with the footer about where the boundary is.
 pub(crate) fn sidebar_footer_rows(app: &AppState) -> u16 {
-    if app.sidebar_resources.enabled && !app.system_resources.is_empty() {
-        SIDEBAR_FOOTER_ROWS
+    if !app.sidebar_resources.enabled || app.system_resources.is_empty() {
+        return 0;
+    }
+    if app.system_resources.cpu_memory_supported {
+        SIDEBAR_FOOTER_EXTENDED_ROWS
     } else {
-        0
+        SIDEBAR_FOOTER_ROWS
     }
 }
 
@@ -1091,8 +1116,27 @@ pub(super) fn render_sidebar(
 /// Decimal gigabyte, matching how `diskutil` and storage vendors report sizes.
 const BYTES_PER_GB: f64 = 1_000_000_000.0;
 
+/// Binary gigabyte, the unit every operating system reports memory in.
+///
+/// Deliberately different from the decimal gigabyte the disk rows use. A
+/// machine sold as 16 GB holds 17.18 decimal GB of RAM, and Activity Monitor,
+/// `free -h` and Task Manager all call that 16 GB — printing `17` beside them
+/// would look like a bug. Disks are sold and reported in decimal, memory in
+/// binary, and the footer follows each convention where it applies.
+const BYTES_PER_GIB: f64 = 1_073_741_824.0;
+
+/// What a reading the host could not answer prints.
+const MISSING_READING: &str = "--";
+
 /// Narrowest footer content that still fits ` SWAP  0.0 GB`.
 const FOOTER_WIDE_MIN_WIDTH: u16 = 13;
+
+/// Narrowest footer content that still fits ` RAM   9.8/16 GB`.
+///
+/// The memory row is the longest of the four, so it is what decides whether
+/// CPU and memory can be shown at all. Below this the footer drops back to
+/// disk and swap rather than cutting a number in half.
+const FOOTER_EXTENDED_MIN_WIDTH: u16 = 16;
 
 /// Narrowest footer content that still fits the abbreviated ` SWAP 0.0G`.
 ///
@@ -1124,6 +1168,37 @@ fn format_resource_gb_short(bytes: u64) -> String {
         format!("{gb:.0}G")
     } else {
         format!("{gb:.1}G")
+    }
+}
+
+/// Formats whole-machine CPU load, or `--` before the first pair of samples.
+fn format_cpu_percent(percent: Option<u8>) -> String {
+    percent.map_or_else(
+        || MISSING_READING.to_string(),
+        |percent| format!("{percent}%"),
+    )
+}
+
+/// Formats memory as used-over-installed, or `--` when the host did not answer.
+///
+/// The installed figure drops its decimal when the machine has a whole number
+/// of gigabytes, which every physical Mac does; a VM given an odd amount keeps
+/// a tenth rather than rounding to a size that does not exist.
+fn format_memory(reading: Option<MemoryReading>, wide: bool) -> String {
+    let Some(reading) = reading else {
+        return MISSING_READING.to_string();
+    };
+    let used = reading.used_bytes as f64 / BYTES_PER_GIB;
+    let total = reading.total_bytes as f64 / BYTES_PER_GIB;
+    let total = if (total - total.round()).abs() < 0.05 {
+        format!("{total:.0}")
+    } else {
+        format!("{total:.1}")
+    };
+    if wide {
+        format!("{used:.1}/{total} GB")
+    } else {
+        format!("{used:.1}/{total}G")
     }
 }
 
@@ -1222,21 +1297,48 @@ fn render_sidebar_resources(app: &AppState, frame: &mut Frame, area: Rect) {
         (format_resource_gb_short, FOOTER_LABEL_COLUMN_NARROW)
     };
 
-    for (row, (label, reading, marker)) in [
-        (
+    // CPU and memory ride above disk and swap, and only when the rect the
+    // layout handed down has room for the whole pair. Their values carry no
+    // pressure band and no refresh marker: they move constantly, so colouring
+    // or marking every change would make the footer flicker for no gain.
+    let extended = area.height >= SIDEBAR_FOOTER_EXTENDED_ROWS;
+    let mut rows: Vec<(&str, String, Style, Option<Span<'static>>)> = Vec::new();
+    if extended {
+        rows.push((
+            "CPU",
+            format_cpu_percent(app.system_resources.cpu_percent),
+            label_style,
+            None,
+        ));
+        rows.push((
+            "RAM",
+            format_memory(app.system_resources.memory, wide),
+            label_style,
+            None,
+        ));
+    }
+    if let Some(reading) = app.system_resources.disk_available {
+        rows.push((
             "SSD",
-            app.system_resources.disk_available,
+            format(reading.bytes),
+            resource_pressure_style(reading.pressure, p),
             disk_marker_span(app.system_resources.disk_marker, p),
-        ),
-        ("SWAP", app.system_resources.swap_used, None),
-    ]
-    .into_iter()
-    .enumerate()
-    {
-        let Some(reading) = reading else {
-            continue;
-        };
+        ));
+    }
+    if let Some(reading) = app.system_resources.swap_used {
+        rows.push((
+            "SWAP",
+            format(reading.bytes),
+            resource_pressure_style(reading.pressure, p),
+            None,
+        ));
+    }
+
+    for (row, (label, value, value_style, marker)) in rows.into_iter().enumerate() {
         let row_y = area.y + 1 + row as u16;
+        if row_y >= area.y + area.height {
+            break;
+        }
         // The sidebar's collapse toggle owns the right edge of the bottom row,
         // so that row stops one column short of it.
         let on_toggle_row = row_y + 1 == area.y + area.height;
@@ -1246,11 +1348,11 @@ fn render_sidebar_resources(app: &AppState, frame: &mut Frame, area: Rect) {
         }
         let line = resource_line(
             label,
-            &format(reading.bytes),
+            &value,
             label_column,
             row_width as usize,
             label_style,
-            resource_pressure_style(reading.pressure, p),
+            value_style,
             marker,
             // The footer rect already stops short of the separator, and
             // `row_width` gives the bottom row's column back to the collapse
@@ -2993,6 +3095,7 @@ rows = [[{ token = "git_status", fg = "#123456" }]]
                 pressure: ResourcePressure::Normal,
             }),
             disk_marker: crate::app::system_resources::DiskRefreshMarker::Refreshed,
+            ..Default::default()
         };
         let area = Rect::new(0, 0, 40, 20);
         let mut terminal = Terminal::new(TestBackend::new(area.width, area.height)).unwrap();
@@ -3203,6 +3306,7 @@ rows = [[{ token = "git_status", fg = "#123456" }]]
                     pressure: ResourcePressure::Normal,
                 }),
                 disk_marker: DiskRefreshMarker::Refreshed,
+                ..Default::default()
             };
             let area = Rect::new(0, 0, width, 30);
             dump(&format!("list selected w{width}"), &app, area, 8);
@@ -4443,6 +4547,7 @@ rows = [[{ token = "git_status", fg = "#123456" }]]
                 pressure: crate::app::system_resources::ResourcePressure::Normal,
             }),
             disk_marker,
+            ..Default::default()
         };
         app
     }
@@ -4456,6 +4561,405 @@ rows = [[{ token = "git_status", fg = "#123456" }]]
             .draw(|frame| render_sidebar(app, &TerminalRuntimeRegistry::new(), frame, area))
             .unwrap();
         terminal.backend().buffer().clone()
+    }
+
+    /// An app whose footer also has CPU and memory to show.
+    fn app_with_full_readings(
+        cpu_percent: Option<u8>,
+        memory: Option<(u64, u64)>,
+    ) -> crate::app::state::AppState {
+        let mut app =
+            app_with_marked_readings(180_000_000_000, 700_000_000, DiskRefreshMarker::None);
+        app.system_resources.cpu_memory_supported = true;
+        app.system_resources.cpu_percent = cpu_percent;
+        app.system_resources.memory =
+            memory.map(
+                |(used_bytes, total_bytes)| crate::app::system_resources::MemoryReading {
+                    used_bytes,
+                    total_bytes,
+                },
+            );
+        app
+    }
+
+    const GIB: u64 = 1_073_741_824;
+
+    #[test]
+    fn the_footer_reads_cpu_memory_disk_and_swap_in_that_order() {
+        let app = app_with_full_readings(Some(14), Some((GIB * 98 / 10, GIB * 16)));
+        let area = Rect::new(0, 0, 26, 24);
+        let buffer = render_sidebar_to_buffer(&app, area);
+
+        assert_eq!(sidebar_footer_rows(&app), SIDEBAR_FOOTER_EXTENDED_ROWS);
+        let footer = sidebar_footer_rect(area, sidebar_footer_rows(&app));
+        assert_eq!(footer.height, 5);
+
+        assert_eq!(row_text(&buffer, footer.y + 1, 25), " CPU   14%");
+        assert_eq!(row_text(&buffer, footer.y + 2, 25), " RAM   9.8/16 GB");
+        assert_eq!(row_text(&buffer, footer.y + 3, 25), " SSD   180 GB");
+        assert_eq!(row_text(&buffer, footer.y + 4, 24), " SWAP  0.7 GB");
+
+        // Every value starts in the same column, whichever label precedes it.
+        let value_column = |row: u16, needle: &str| {
+            let text = row_text(&buffer, row, 25);
+            text.find(needle).expect("value in row") as u16
+        };
+        assert_eq!(value_column(footer.y + 1, "14%"), 7);
+        assert_eq!(value_column(footer.y + 2, "9.8"), 7);
+        assert_eq!(value_column(footer.y + 3, "180"), 7);
+        assert_eq!(value_column(footer.y + 4, "0.7"), 7);
+    }
+
+    #[test]
+    fn cpu_and_memory_are_neutral_and_carry_no_marker() {
+        let palette = crate::app::state::Palette::catppuccin();
+        let app = app_with_full_readings(Some(100), Some((GIB * 15, GIB * 16)));
+        let area = Rect::new(0, 0, 26, 24);
+        let buffer = render_sidebar_to_buffer(&app, area);
+        let footer = sidebar_footer_rect(area, sidebar_footer_rows(&app));
+
+        for row in [footer.y + 1, footer.y + 2] {
+            let text = row_text(&buffer, row, 25);
+            for x in 0..25u16 {
+                let cell = &buffer[(x, row)];
+                if cell.symbol() == " " {
+                    continue;
+                }
+                assert_eq!(cell.fg, palette.overlay1, "row {row:?}: {text:?}");
+                assert!(
+                    !cell.modifier.contains(ratatui::style::Modifier::BOLD),
+                    "row {row:?} is bold: {text:?}"
+                );
+            }
+            assert!(!text.contains('✓'), "{text:?} carries a refresh marker");
+            assert!(!text.contains('!'), "{text:?} carries a refresh marker");
+        }
+    }
+
+    #[test]
+    fn the_disk_marker_still_belongs_to_the_disk_row_alone() {
+        for (marker, glyph) in [
+            (DiskRefreshMarker::Refreshed, "✓"),
+            (DiskRefreshMarker::Stale, "!"),
+        ] {
+            let mut app = app_with_full_readings(Some(14), Some((GIB * 98 / 10, GIB * 16)));
+            app.system_resources.disk_marker = marker;
+            let area = Rect::new(0, 0, 26, 24);
+            let buffer = render_sidebar_to_buffer(&app, area);
+            let footer = sidebar_footer_rect(area, sidebar_footer_rows(&app));
+
+            assert_eq!(
+                row_text(&buffer, footer.y + 3, 25),
+                format!(" SSD   180 GB {glyph}")
+            );
+            for row in [footer.y + 1, footer.y + 2, footer.y + 4] {
+                let text = row_text(&buffer, row, 24);
+                assert!(!text.contains(glyph), "row {row}: {text:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn a_reading_the_host_could_not_answer_prints_a_dash() {
+        let app = app_with_full_readings(None, None);
+        let area = Rect::new(0, 0, 26, 24);
+        let buffer = render_sidebar_to_buffer(&app, area);
+        let footer = sidebar_footer_rect(area, sidebar_footer_rows(&app));
+
+        assert_eq!(row_text(&buffer, footer.y + 1, 25), " CPU   --");
+        assert_eq!(row_text(&buffer, footer.y + 2, 25), " RAM   --");
+        // The rows below are unaffected: one reading failing is not four.
+        assert_eq!(row_text(&buffer, footer.y + 3, 25), " SSD   180 GB");
+        assert_eq!(row_text(&buffer, footer.y + 4, 24), " SWAP  0.7 GB");
+    }
+
+    #[test]
+    fn a_short_sidebar_gives_up_cpu_and_memory_together() {
+        let app = app_with_full_readings(Some(14), Some((GIB * 98 / 10, GIB * 16)));
+        let mut seen_extended = false;
+        let mut seen_core = false;
+        let mut seen_none = false;
+
+        for height in 6..=24u16 {
+            let area = Rect::new(0, 0, 26, height);
+            let rows = fitted_footer_rows(
+                Rect::new(0, 0, area.width.saturating_sub(1), area.height),
+                sidebar_footer_rows(&app),
+            );
+            // Only three outcomes, never a partial footer.
+            assert!(
+                rows == 0 || rows == SIDEBAR_FOOTER_ROWS || rows == SIDEBAR_FOOTER_EXTENDED_ROWS,
+                "height {height} produced {rows} rows"
+            );
+            let buffer = render_sidebar_to_buffer(&app, area);
+            let text: String = (0..height)
+                .map(|row| row_text(&buffer, row, 25))
+                .collect::<Vec<_>>()
+                .join("\n");
+            let has_cpu = text.contains("CPU");
+            let has_ram = text.contains("RAM");
+            assert_eq!(
+                has_cpu, has_ram,
+                "height {height}: one of the pair is alone"
+            );
+
+            match rows {
+                r if r == SIDEBAR_FOOTER_EXTENDED_ROWS => {
+                    seen_extended = true;
+                    assert!(has_cpu && text.contains("SSD") && text.contains("SWAP"));
+                }
+                r if r == SIDEBAR_FOOTER_ROWS => {
+                    seen_core = true;
+                    // Disk and swap are what survive, and they survive alone.
+                    assert!(!has_cpu, "height {height}: {text:?}");
+                    assert!(text.contains("SSD") && text.contains("SWAP"));
+                }
+                _ => {
+                    seen_none = true;
+                    assert!(!has_cpu && !text.contains("SSD"));
+                }
+            }
+        }
+        assert!(
+            seen_extended && seen_core && seen_none,
+            "every case covered"
+        );
+    }
+
+    #[test]
+    fn the_agents_list_keeps_the_rows_the_footer_does_not_take() {
+        // Whichever height the footer settles on, the sections give up exactly
+        // that many rows and the Agents list still ends above the footer.
+        let app = app_with_full_readings(Some(14), Some((GIB * 98 / 10, GIB * 16)));
+        for height in 8..=30u16 {
+            let area = Rect::new(0, 0, 26, height);
+            let footer_rows = sidebar_footer_rows(&app);
+            let (ws, agents) =
+                expanded_sidebar_sections(area, app.sidebar_section_split, footer_rows);
+            let (bare_ws, bare_agents) =
+                expanded_sidebar_sections(area, app.sidebar_section_split, 0);
+            let footer = sidebar_footer_rect(area, footer_rows);
+
+            assert_eq!(
+                ws.height + agents.height + footer.height,
+                bare_ws.height + bare_agents.height,
+                "height {height}"
+            );
+            if footer.height > 0 {
+                assert_eq!(agents.y + agents.height, footer.y, "height {height}");
+                assert_eq!(footer.y + footer.height, area.y + area.height);
+                assert!(agent_panel_body_rect(agents, false).bottom() <= footer.y);
+            }
+        }
+    }
+
+    #[test]
+    fn a_narrow_sidebar_gives_up_cpu_and_memory_rather_than_cutting_a_number() {
+        let app = app_with_full_readings(Some(14), Some((GIB * 98 / 10, GIB * 16)));
+        for width in 10..=30u16 {
+            let area = Rect::new(0, 0, width, 24);
+            let buffer = render_sidebar_to_buffer(&app, area);
+            let text: String = (0..24u16)
+                .map(|row| row_text(&buffer, row, width))
+                .collect::<Vec<_>>()
+                .join("\n");
+            let has_cpu = text.contains("CPU");
+            assert_eq!(has_cpu, text.contains("RAM"), "width {width}");
+            if has_cpu {
+                // Wide enough to show it means wide enough to show it whole.
+                assert!(text.contains("9.8/16 GB"), "width {width}: {text:?}");
+            }
+            // Nothing is ever drawn past the sidebar's own columns.
+            for row in 0..24u16 {
+                assert!(row_text(&buffer, row, width).chars().count() <= width as usize);
+            }
+        }
+    }
+
+    #[test]
+    fn memory_prints_a_whole_number_of_gigabytes_when_the_machine_has_one() {
+        let cases = [
+            // (used, total, wide, expected)
+            ((GIB * 98 / 10, GIB * 16), true, "9.8/16 GB"),
+            ((GIB * 98 / 10, GIB * 16), false, "9.8/16G"),
+            ((GIB / 2, GIB * 8), true, "0.5/8 GB"),
+            ((GIB * 121, GIB * 128), true, "121.0/128 GB"),
+            // A VM given an odd amount keeps the tenth rather than claiming a
+            // size the machine does not have.
+            ((GIB * 3, GIB * 13 / 2), true, "3.0/6.5 GB"),
+        ];
+        for ((used_bytes, total_bytes), wide, expected) in cases {
+            let reading = Some(crate::app::system_resources::MemoryReading {
+                used_bytes,
+                total_bytes,
+            });
+            assert_eq!(format_memory(reading, wide), expected);
+        }
+        assert_eq!(format_memory(None, true), "--");
+        assert_eq!(format_cpu_percent(None), "--");
+        assert_eq!(format_cpu_percent(Some(0)), "0%");
+        assert_eq!(format_cpu_percent(Some(7)), "7%");
+        assert_eq!(format_cpu_percent(Some(100)), "100%");
+    }
+
+    /// Dumps the footer as `render_sidebar` actually drew it, for visual review.
+    ///
+    /// Ignored by default because its output is a picture, not an assertion:
+    ///
+    /// ```text
+    /// cargo nextest run -E 'test(cpu_ram_footer_preview)' \
+    ///     --run-ignored all --no-capture
+    /// ```
+    #[test]
+    #[ignore = "prints a cell dump for visual review rather than asserting"]
+    fn cpu_ram_footer_preview() {
+        use crate::detect::AgentState as S;
+
+        fn color(c: ratatui::style::Color) -> String {
+            match c {
+                ratatui::style::Color::Rgb(r, g, b) => format!("#{r:02x}{g:02x}{b:02x}"),
+                ratatui::style::Color::Reset => "reset".to_string(),
+                other => format!("{other:?}"),
+            }
+        }
+
+        fn dump(name: &str, app: &crate::app::state::AppState, area: Rect) {
+            let mut terminal = Terminal::new(TestBackend::new(area.width, area.height)).unwrap();
+            terminal
+                .draw(|frame| render_sidebar(app, &TerminalRuntimeRegistry::new(), frame, area))
+                .unwrap();
+            let buffer = terminal.backend().buffer();
+            for row in 0..area.height {
+                let cells = (0..area.width)
+                    .map(|x| {
+                        let cell = &buffer[(x, row)];
+                        format!(
+                            "{}|{}|{}|{}",
+                            cell.symbol(),
+                            color(cell.fg),
+                            color(cell.bg),
+                            cell.modifier.contains(Modifier::BOLD)
+                        )
+                    })
+                    .collect::<Vec<_>>()
+                    .join("\t");
+                println!("CELL\t{name}\t{row}\t{cells}");
+            }
+        }
+
+        /// One workspace with `agents` running panes, so the footer can be
+        /// seen against both a short list and a list that fills the section.
+        fn app_with_agents(agents: usize) -> crate::app::state::AppState {
+            let mut app = app_with_full_readings(Some(14), Some((GIB * 98 / 10, GIB * 16)));
+            let mut workspace = Workspace::test_new("~");
+            workspace.tabs[0].set_custom_name("main".into());
+            let mut panes = vec![workspace.tabs[0].root_pane];
+            for name in ["CoreBeasts", "KoeNote", "build", "deploy", "docs", "api"]
+                .into_iter()
+                .take(agents.saturating_sub(1))
+            {
+                let tab = workspace.test_add_tab(Some(name));
+                panes.push(workspace.tabs[tab].root_pane);
+            }
+            workspace.active_tab = 0;
+            app.workspaces = vec![workspace];
+            app.ensure_test_terminals();
+            app.active = Some(0);
+            let start = std::time::Instant::now();
+            for (index, pane) in panes.iter().enumerate() {
+                let terminal_id = app.workspaces[0].tabs[index].panes[pane]
+                    .attached_terminal_id
+                    .clone();
+                if let Some(terminal) = app.terminals.get_mut(&terminal_id) {
+                    terminal.detected_agent = Some(Agent::Claude);
+                    terminal.state = S::Working;
+                }
+                app.work_timers
+                    .on_state_change(*pane, S::Idle, S::Working, start);
+            }
+            app.work_clock = Some(start + std::time::Duration::from_secs(84));
+            app
+        }
+
+        let full = Some((GIB * 98 / 10, GIB * 16));
+
+        // Every reading, and the readings a host could not answer.
+        for (name, cpu, memory) in [
+            ("normal", Some(14u8), full),
+            ("cpu-before-first-pair", None, full),
+            ("cpu-000", Some(0), full),
+            ("cpu-050", Some(50), full),
+            ("cpu-100", Some(100), full),
+            ("ram-unavailable", Some(14), None),
+            ("both-unavailable", None, None),
+        ] {
+            let mut app = app_with_agents(3);
+            app.system_resources.cpu_percent = cpu;
+            app.system_resources.memory = memory.map(|(used_bytes, total_bytes)| {
+                crate::app::system_resources::MemoryReading {
+                    used_bytes,
+                    total_bytes,
+                }
+            });
+            dump(&format!("{name} w26 h24"), &app, Rect::new(0, 0, 26, 24));
+        }
+
+        // The disk row keeps its own marker, above and below.
+        for (name, marker) in [
+            ("ssd-refreshed", DiskRefreshMarker::Refreshed),
+            ("ssd-stale", DiskRefreshMarker::Stale),
+            ("ssd-steady", DiskRefreshMarker::None),
+        ] {
+            let mut app = app_with_agents(3);
+            app.system_resources.disk_marker = marker;
+            dump(&format!("{name} w26 h24"), &app, Rect::new(0, 0, 26, 24));
+        }
+
+        // Height: four readings, then the fall back to disk and swap alone.
+        for height in [24u16, 16, 12, 11, 10, 9, 8] {
+            let app = app_with_agents(3);
+            dump(
+                &format!("height-{height:02} w26"),
+                &app,
+                Rect::new(0, 0, 26, height),
+            );
+        }
+
+        // Width.
+        for width in [34u16, 30, 26, 22, 18, 16, 15, 13, 11] {
+            let app = app_with_agents(3);
+            dump(
+                &format!("width-{width:02} h24"),
+                &app,
+                Rect::new(0, 0, width, 24),
+            );
+        }
+
+        // A short list and a list that fills the section.
+        for agents in [1usize, 7] {
+            let app = app_with_agents(agents);
+            dump(
+                &format!("agents-{agents} w30 h24"),
+                &app,
+                Rect::new(0, 0, 30, 24),
+            );
+        }
+
+        // Four consecutive three-second samples, so the CPU row can be
+        // watched moving.
+        for (frame, percent) in [(0u8, 9u8), (1, 23), (2, 61), (3, 17)] {
+            let mut app = app_with_agents(3);
+            app.system_resources.cpu_percent = Some(percent);
+            app.system_resources.memory = Some(crate::app::system_resources::MemoryReading {
+                used_bytes: GIB * (96 + u64::from(frame)) / 10,
+                total_bytes: GIB * 16,
+            });
+            dump(
+                &format!("tick-{frame} w26 h24"),
+                &app,
+                Rect::new(0, 0, 26, 24),
+            );
+        }
     }
 
     #[test]

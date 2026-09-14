@@ -2507,8 +2507,8 @@ impl Drop for InputSourceRestore {
     }
 }
 
-/// Windows has no equivalent sidebar resource readout yet, so both readings
-/// stay absent and the footer hides itself instead of showing a fake zero.
+/// Windows has no equivalent sidebar resource readout yet, so every reading
+/// stays absent and the footer hides itself instead of showing a fake zero.
 pub fn system_resource_sample() -> SystemResourceSample {
     SystemResourceSample::default()
 }

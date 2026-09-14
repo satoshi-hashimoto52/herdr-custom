@@ -25,9 +25,36 @@ pub enum Signal {
     Kill,
 }
 
-/// Host disk and swap pressure sampled from OS APIs, not shelled-out commands.
+/// Cumulative CPU time, summed over every logical CPU.
 ///
-/// Both fields stay `None` on platforms without a supported query so callers
+/// Counters rather than a percentage: a rate needs two readings, and only the
+/// caller knows how far apart its own samples are. Summing the per-CPU states
+/// here is what makes the whole machine 100% rather than one core.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct CpuTicks {
+    /// Time spent in any state other than idle.
+    pub busy: u64,
+    /// Time spent in every state, idle included.
+    pub total: u64,
+}
+
+/// Physical memory in use against physical memory installed.
+///
+/// `used_bytes` deliberately excludes reclaimable cache: on macOS it is what
+/// Activity Monitor calls Memory Used — app memory, wired, and compressed —
+/// and on Linux it is `MemTotal - MemAvailable`, the kernel's own estimate of
+/// what a new allocation could not simply take back. A plain `total - free`
+/// would count the page cache as used and read as though the machine were
+/// permanently full.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MemoryUsage {
+    pub used_bytes: u64,
+    pub total_bytes: u64,
+}
+
+/// Host resource pressure sampled from OS APIs, not shelled-out commands.
+///
+/// Every field stays `None` on platforms without a supported query so callers
 /// can hide the reading instead of rendering a fabricated zero.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct SystemResourceSample {
@@ -36,6 +63,10 @@ pub struct SystemResourceSample {
     pub disk_available_bytes: Option<u64>,
     /// Swap currently in use, matching the `used` field of `vm.swapusage`.
     pub swap_used_bytes: Option<u64>,
+    /// Cumulative CPU time for the whole machine.
+    pub cpu_ticks: Option<CpuTicks>,
+    /// Physical memory in use and installed.
+    pub memory: Option<MemoryUsage>,
 }
 
 pub(crate) fn detached_custom_command_process(command: &str) -> std::process::Command {
