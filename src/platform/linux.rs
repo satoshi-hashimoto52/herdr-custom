@@ -830,7 +830,7 @@ fn available_disk_bytes(path: &std::path::Path) -> Option<u64> {
     }
     // SAFETY: `statvfs` returned success, so the buffer is initialized.
     let stat = unsafe { stat.assume_init() };
-    u64::from(stat.f_frsize).checked_mul(stat.f_bavail)
+    stat.f_frsize.checked_mul(stat.f_bavail)
 }
 
 /// Swap in use, derived from `SwapTotal` minus `SwapFree`.

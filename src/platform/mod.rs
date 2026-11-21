@@ -59,6 +59,15 @@ pub struct MemoryUsage {
 /// from a percentage of installed RAM. Unsupported platforms and failed reads
 /// report `Unknown`, which presentation code treats exactly like `Normal`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+// Linux does not currently report memory-pressure levels, so only `Unknown`
+// is constructed there; other platforms still get dead-code warnings.
+#[cfg_attr(
+    target_os = "linux",
+    allow(
+        dead_code,
+        reason = "Linux does not currently report memory-pressure levels"
+    )
+)]
 pub enum MemoryPressureLevel {
     Normal,
     Warning,
