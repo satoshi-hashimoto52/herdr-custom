@@ -419,6 +419,7 @@ fn setup_terminal_with_capabilities(
     execute!(io::stdout(), DisableLineWrap)?;
 
     Ok(TerminalGuard {
+        mouse_capture_active: mouse_capture,
         reset_modify_other_keys: modify_other_keys_mode.is_some(),
         reset_host_color_scheme_reports: host_color_scheme_reports,
         restored: false,
@@ -433,6 +434,7 @@ fn should_enable_host_color_scheme_reports(enable_client_protocols: bool) -> boo
 
 /// Guard that restores the terminal when dropped.
 struct TerminalGuard {
+    mouse_capture_active: bool,
     reset_modify_other_keys: bool,
     reset_host_color_scheme_reports: bool,
     restored: bool,
@@ -602,6 +604,7 @@ fn restore_terminal_state(
         DisableBracketedPaste,
         DisableMouseCapture
     );
+    crate::app::files_trace::terminal_restored(true);
     let _ = crate::terminal_modes::clear_host_mouse_reporting(&mut io::stdout());
     #[cfg(windows)]
     if let Some(mode) = restore_windows_input_mode {
@@ -1210,6 +1213,7 @@ fn run_client_with_mode(
     attach_escape: Option<AttachEscapeState>,
     log_message: &'static str,
 ) -> io::Result<()> {
+    crate::app::files_trace::startup(false);
     init_logging();
 
     let loaded_config = crate::config::Config::load();
@@ -1292,6 +1296,12 @@ fn run_client_with_mode(
         eprintln!("herdr: failed to set up terminal: {err}");
         err
     })?;
+    crate::app::files_trace::terminal_initialized(
+        false,
+        true,
+        true,
+        terminal_guard.mouse_capture_active,
+    );
 
     // Install a panic hook to restore the terminal on panic (same as monolithic).
     let panic_resets_modify_other_keys = terminal_guard.reset_modify_other_keys;
@@ -1327,6 +1337,12 @@ fn run_client_with_mode(
     }
 
     let result = rt.block_on(async {
+        crate::app::files_trace::event_loop_started(
+            false,
+            true,
+            true,
+            terminal_guard.mouse_capture_active,
+        );
         run_client_loop(
             stream,
             cols,

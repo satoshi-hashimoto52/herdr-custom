@@ -5,7 +5,7 @@ use std::path::Path;
 use jsonc_parser::ast::{Array as AstArray, Object as AstObject, Value as AstValue};
 use jsonc_parser::common::Ranged;
 use jsonc_parser::cst::{CstInputValue, CstNode, CstObject, CstRootNode};
-use jsonc_parser::{json, parse_to_ast, CollectOptions, ParseOptions};
+use jsonc_parser::{parse_to_ast, CollectOptions, ParseOptions};
 use serde_json::{json as serde_json_value, Map, Value};
 
 use super::command::hook_command;
@@ -58,6 +58,16 @@ const HOOK_REMOVALS: &[HookRemoval] = &[
     },
 ];
 
+const HOOK_EVENTS: &[&str] = &[
+    "SessionStart",
+    "UserPromptSubmit",
+    "PreToolUse",
+    "PostToolUse",
+    "PostToolUseFailure",
+    "Stop",
+    "SessionEnd",
+];
+
 pub(crate) fn install(content: &str, settings_path: &Path, hook_path: &Path) -> io::Result<String> {
     let original = parse_value(content, settings_path)?;
     let mut desired = original.clone();
@@ -69,13 +79,15 @@ pub(crate) fn install(content: &str, settings_path: &Path, hook_path: &Path) -> 
     )?;
     let canonical = canonical_hook_value(hook_path);
     apply_value_removals(hooks, hook_path, Some(&canonical))?;
-    ensure_command_hook(
-        hooks,
-        "SessionStart",
-        hook_command(hook_path, Some("session")),
-        10,
-        Some("*"),
-    )?;
+    for event in HOOK_EVENTS {
+        ensure_command_hook(
+            hooks,
+            event,
+            hook_command(hook_path, Some("session")),
+            10,
+            Some("*"),
+        )?;
+    }
 
     if desired == original {
         return Ok(content.to_string());
@@ -220,12 +232,6 @@ fn rewrite(
                 settings_path.display()
             ))
         })?,
-        None if kind == EditKind::Install
-            && direct_children_are_compact(&root_object.children()) =>
-        {
-            let updated = append_hooks_property_compact(content, hook_path, settings_path)?;
-            return verify_updated(updated, settings_path, desired);
-        }
         None if kind == EditKind::Install => root_object
             .append("hooks", CstInputValue::Object(Vec::new()))
             .object_value()
@@ -234,10 +240,9 @@ fn rewrite(
     };
 
     let canonical = canonical_hook_value(hook_path);
-    let mut canonical_preserved = false;
     for policy in HOOK_REMOVALS {
         let commands = removal_commands(policy, hook_path);
-        canonical_preserved |= remove_event_commands(
+        remove_event_commands(
             &hooks,
             policy.event,
             &commands,
@@ -246,32 +251,36 @@ fn rewrite(
         )?;
     }
 
-    if kind == EditKind::Install && !canonical_preserved {
-        match hooks.get("SessionStart") {
-            Some(property) => {
-                let session_start = property.array_value().ok_or_else(|| {
-                    io::Error::other("hook entries for SessionStart must be an array")
-                })?;
-                if direct_children_are_compact(&session_start.children()) {
-                    let updated =
-                        append_session_entry_compact(&root.to_string(), hook_path, settings_path)?;
-                    return verify_updated(updated, settings_path, desired);
+    if kind == EditKind::Install {
+        let mut updated = root.to_string();
+        for event in HOOK_EVENTS {
+            let ast_root = parse_ast_root_object(&updated, settings_path)?;
+            let ast_hooks = ast_root.get_object("hooks").ok_or_else(|| {
+                io::Error::other(format!(
+                    "claude settings hooks at {} must be a JSON object",
+                    settings_path.display()
+                ))
+            })?;
+            if let Some(entries) = ast_hooks.get_array(event) {
+                if !updated[entries.range.start..entries.range.end]
+                    .contains(&hook_path.display().to_string())
+                {
+                    updated = append_array_element(
+                        &updated,
+                        entries,
+                        &serde_json::to_string(&canonical_hook_value(hook_path))?,
+                    );
                 }
-                session_start.append(canonical_hook_input(hook_path));
-            }
-            None if direct_children_are_compact(&hooks.children()) => {
-                let updated =
-                    append_session_property_compact(&root.to_string(), hook_path, settings_path)?;
-                return verify_updated(updated, settings_path, desired);
-            }
-            None => {
-                let session_start = hooks
-                    .append("SessionStart", CstInputValue::Array(Vec::new()))
-                    .array_value()
-                    .ok_or_else(|| io::Error::other("failed to create SessionStart hook array"))?;
-                session_start.append(canonical_hook_input(hook_path));
+            } else {
+                updated = append_object_property(
+                    &updated,
+                    ast_hooks,
+                    event,
+                    &format!("[{}]", canonical_hook_json(hook_path)?),
+                );
             }
         }
+        return verify_updated(updated, settings_path, desired);
     }
 
     verify_updated(root.to_string(), settings_path, desired)
@@ -354,64 +363,15 @@ fn canonical_hook_value(hook_path: &Path) -> Value {
     })
 }
 
-fn canonical_hook_input(hook_path: &Path) -> CstInputValue {
-    let command = hook_command(hook_path, Some("session"));
-    json!({
-        matcher: "*",
-        hooks: [{
-            "type": "command",
-            command: command,
-            timeout: 10u64,
-        }],
-    })
-}
-
-fn append_hooks_property_compact(
-    content: &str,
-    hook_path: &Path,
-    settings_path: &Path,
-) -> io::Result<String> {
-    let root = parse_ast_root_object(content, settings_path)?;
-    let value = format!("{{\"SessionStart\":[{}]}}", canonical_hook_json(hook_path)?);
-    Ok(append_object_property(content, &root, "hooks", &value))
-}
-
-fn append_session_property_compact(
-    content: &str,
-    hook_path: &Path,
-    settings_path: &Path,
-) -> io::Result<String> {
-    let root = parse_ast_root_object(content, settings_path)?;
-    let hooks = root.get_object("hooks").ok_or_else(|| {
-        io::Error::other(format!(
-            "claude settings hooks at {} must be a JSON object",
-            settings_path.display()
-        ))
-    })?;
-    let value = format!("[{}]", canonical_hook_json(hook_path)?);
-    Ok(append_object_property(
+fn append_array_element(content: &str, array: &AstArray<'_>, value: &str) -> String {
+    let delimiter = array_delimiter(content, array);
+    append_to_container(
         content,
-        hooks,
-        "SessionStart",
-        &value,
-    ))
-}
-
-fn append_session_entry_compact(
-    content: &str,
-    hook_path: &Path,
-    settings_path: &Path,
-) -> io::Result<String> {
-    let root = parse_ast_root_object(content, settings_path)?;
-    let session_start = root
-        .get_object("hooks")
-        .and_then(|hooks| hooks.get_array("SessionStart"))
-        .ok_or_else(|| io::Error::other("hook entries for SessionStart must be an array"))?;
-    Ok(append_array_element(
-        content,
-        session_start,
-        &canonical_hook_json(hook_path)?,
-    ))
+        array.range,
+        !array.elements.is_empty(),
+        delimiter,
+        value,
+    )
 }
 
 fn parse_ast_root_object<'a>(content: &'a str, settings_path: &Path) -> io::Result<AstObject<'a>> {
@@ -451,17 +411,6 @@ fn append_object_property(
         !object.properties.is_empty(),
         delimiter,
         &insertion,
-    )
-}
-
-fn append_array_element(content: &str, array: &AstArray<'_>, value: &str) -> String {
-    let delimiter = array_delimiter(content, array);
-    append_to_container(
-        content,
-        array.range,
-        !array.elements.is_empty(),
-        delimiter,
-        value,
     )
 }
 
@@ -528,10 +477,6 @@ fn verify_updated(updated: String, settings_path: &Path, desired: &Value) -> io:
         )));
     }
     Ok(updated)
-}
-
-fn direct_children_are_compact(children: &[CstNode]) -> bool {
-    !children.iter().any(CstNode::is_newline)
 }
 
 fn parse_value(content: &str, settings_path: &Path) -> io::Result<Value> {

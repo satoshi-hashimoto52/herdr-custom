@@ -9,6 +9,7 @@ use ratatui::{
 };
 
 use self::tokens::{ResolvedToken, ResolvedTokenKind, SpaceTokenContext};
+use super::files::render_files;
 use super::scrollbar::{render_scrollbar, should_show_scrollbar};
 use super::status::{
     pane_state_icon, pane_state_label, pane_state_label_color, pane_status_key,
@@ -19,6 +20,7 @@ use crate::app::state::{AgentPanelSort, Palette};
 use crate::app::system_resources::{DiskRefreshMarker, MemoryReading, ResourcePressure};
 use crate::app::{AppState, Mode};
 use crate::detect::AgentState;
+use crate::platform::MemoryPressureLevel;
 use crate::terminal::TerminalRuntimeRegistry;
 
 const WORKSPACE_SECTION_HEADER_ROWS: u16 = 2;
@@ -55,11 +57,73 @@ fn sidebar_section_heights(total_h: u16, split_ratio: f32) -> (u16, u16) {
         return (ws_h, total_h.saturating_sub(ws_h));
     }
 
-    let ratio = split_ratio.clamp(0.1, 0.9);
+    let ratio = sanitize_spaces_split(Some(split_ratio));
     let ws_h = ((total_h as f32) * ratio).round() as u16;
-    let ws_h = ws_h.clamp(3, total_h.saturating_sub(3));
+    let (min_ws, max_ws) = spaces_height_bounds(total_h);
+    let ws_h = ws_h.clamp(min_ws, max_ws);
     let detail_h = total_h.saturating_sub(ws_h);
     (ws_h, detail_h)
+}
+
+/// Default share of the section rows given to Spaces.
+pub(crate) const DEFAULT_SPACES_SPLIT: f32 = 0.5;
+
+/// Rows Spaces always keeps when the sidebar can afford it: its header, one
+/// list row and its bottom row.
+const SPACES_MIN_ROWS: u16 = WORKSPACE_SECTION_HEADER_ROWS + 2;
+
+/// Rows below the Spaces/Agents divider that must survive any Spaces drag
+/// on a sidebar tall enough: one agent card with its header, the
+/// Agents/Files divider, and the whole fixed Files section (header, one tree
+/// row, buttons, details).
+const LOWER_SECTIONS_FULL_ROWS: u16 = AGENTS_MIN_ROWS
+    + 1
+    + FILES_MIN_ROWS
+    + super::files::FILES_DETAILS_ROWS
+    + super::files::FILES_GAP_ROWS;
+
+/// The floor on short sidebars: the details rows may shrink, but an agent
+/// card, the divider and the Files header/tree/buttons always remain.
+const LOWER_SECTIONS_MIN_ROWS: u16 = AGENTS_MIN_ROWS + 1 + FILES_MIN_ROWS;
+
+/// `(min, max)` Spaces height for `total_h` section rows. Both dividers are
+/// derived from this one budget, so they can never cross:
+/// - Spaces keeps its header and one row;
+/// - the Agents+Files block keeps its full minimum (details included) when
+///   the sidebar is tall enough, and never less than the default half or
+///   its short-sidebar floor otherwise;
+/// - a sidebar too short for any of that falls back to 3-row floors.
+fn spaces_height_bounds(total_h: u16) -> (u16, u16) {
+    if total_h < SPACES_MIN_ROWS + LOWER_SECTIONS_MIN_ROWS {
+        return (3, total_h.saturating_sub(3).max(3));
+    }
+    let half = total_h.div_ceil(2);
+    let max_ws = total_h
+        .saturating_sub(LOWER_SECTIONS_FULL_ROWS)
+        .max(half.min(total_h - LOWER_SECTIONS_MIN_ROWS))
+        .max(SPACES_MIN_ROWS);
+    (SPACES_MIN_ROWS, max_ws)
+}
+
+/// A usable `spaces_split`: finite and within 0.0..=1.0, else the default.
+pub(crate) fn sanitize_spaces_split(value: Option<f32>) -> f32 {
+    value
+        .filter(|value| value.is_finite())
+        .map_or(DEFAULT_SPACES_SPLIT, |value| value.clamp(0.0, 1.0))
+}
+
+/// The `spaces_split` that puts the Spaces/Agents divider on `row`, clamped
+/// to the minimum section heights and snapped to the whole row it produces.
+/// `None` when the sidebar is too short to resize.
+pub(crate) fn spaces_split_for_divider_row(area: Rect, footer_rows: u16, row: u16) -> Option<f32> {
+    let content = Rect::new(area.x, area.y, area.width.saturating_sub(1), area.height);
+    let total_h = sidebar_sections_height(content, footer_rows);
+    if content.width == 0 || total_h < 6 {
+        return None;
+    }
+    let (min_ws, max_ws) = spaces_height_bounds(total_h);
+    let ws_h = row.saturating_sub(content.y).clamp(min_ws, max_ws);
+    Some(f32::from(ws_h) / f32::from(total_h))
 }
 
 /// Rows the pinned resource footer claims at its smallest: a divider plus one
@@ -121,7 +185,15 @@ fn fitted_footer_rows(content: Rect, footer_rows: u16) -> u16 {
 /// scrolling and the section split all read it, so the Agents list can never
 /// disagree with the footer about where the boundary is.
 pub(crate) fn sidebar_footer_rows(app: &AppState) -> u16 {
-    if !app.sidebar_resources.enabled || app.system_resources.is_empty() {
+    if !app.sidebar_resources.enabled {
+        return 0;
+    }
+    if app.system_resources.awaiting_first_sample {
+        // Reserve the rows the footer will most likely need, so readings
+        // arriving later never move the dividers above it.
+        return SIDEBAR_FOOTER_EXTENDED_ROWS;
+    }
+    if app.system_resources.is_empty() {
         return 0;
     }
     if app.system_resources.cpu_memory_supported {
@@ -173,6 +245,103 @@ pub(crate) fn sidebar_section_divider_rect(area: Rect, split_ratio: f32, footer_
 
     let (ws_h, _) = sidebar_section_heights(sections_h, split_ratio);
     Rect::new(content.x, content.y + ws_h, content.width, 1)
+}
+
+/// Default share of the resizable lower-sidebar rows given to Agents.
+pub(crate) const DEFAULT_FILES_SPLIT: f32 = 0.5;
+
+/// Rows the Agents section always keeps: its header plus one full agent
+/// card (name and state rows), so at least one agent is always visible.
+const AGENTS_MIN_ROWS: u16 = AGENT_PANEL_HEADER_ROWS + 2;
+
+/// Files rows that never stretch: the `files` header and the button row.
+const FILES_FIXED_ROWS: u16 = 2;
+
+/// Files rows that must exist: the fixed rows plus one tree row.
+const FILES_MIN_ROWS: u16 = FILES_FIXED_ROWS + 1;
+
+/// A usable `files_split`: finite and within 0.0..=1.0, else the default.
+pub(crate) fn sanitize_files_split(value: Option<f32>) -> f32 {
+    value
+        .filter(|value| value.is_finite())
+        .map_or(DEFAULT_FILES_SPLIT, |value| value.clamp(0.0, 1.0))
+}
+
+/// Row budget of the lower sidebar for a given height.
+struct FilesSplitBudget {
+    /// Detail rows reserved under the buttons (6 normally, fewer only when
+    /// the sidebar cannot fit them).
+    details: u16,
+    /// The blank row between the tree and the buttons (1 normally; the first
+    /// thing dropped on a short sidebar).
+    gap: u16,
+    /// Rows shared between the Agents list and the Files tree.
+    flexible: u16,
+}
+
+fn files_split_budget(height: u16) -> Option<FilesSplitBudget> {
+    // Agents minimum + divider + Files minimum (header, 1 tree row, buttons).
+    let core = AGENTS_MIN_ROWS + 1 + FILES_MIN_ROWS;
+    let spare = height.checked_sub(core)?;
+    let details = spare.min(super::files::FILES_DETAILS_ROWS);
+    let gap = (spare - details).min(super::files::FILES_GAP_ROWS);
+    Some(FilesSplitBudget {
+        details,
+        gap,
+        flexible: spare - details - gap,
+    })
+}
+
+/// Splits the lower sidebar into the Agents panel, a one-row divider and the
+/// Files section. `files_split` is the share of the resizable rows given to
+/// Agents; the Files fixed rows (header, buttons, details) are reserved
+/// first, so only the Agents list and the Files tree change size. Too short
+/// a sidebar gives everything to Agents.
+pub(crate) fn sidebar_files_layout(
+    area: Rect,
+    split_ratio: f32,
+    footer_rows: u16,
+    files_split: f32,
+) -> (Rect, Rect, Rect) {
+    let (_, detail) = expanded_sidebar_sections(area, split_ratio, footer_rows);
+    let Some(budget) = (detail.width > 0)
+        .then(|| files_split_budget(detail.height))
+        .flatten()
+    else {
+        return (detail, Rect::default(), Rect::default());
+    };
+    let ratio = sanitize_files_split(Some(files_split));
+    let agent_extra = ((f32::from(budget.flexible) * ratio).round() as u16).min(budget.flexible);
+    let agent_height = AGENTS_MIN_ROWS + agent_extra;
+    let divider = Rect::new(detail.x, detail.y + agent_height, detail.width, 1);
+    let files_height = detail.height - agent_height - 1;
+    debug_assert!(files_height >= FILES_MIN_ROWS + budget.details + budget.gap);
+    let files = Rect::new(detail.x, divider.y + 1, detail.width, files_height);
+    (
+        Rect::new(detail.x, detail.y, detail.width, agent_height),
+        files,
+        divider,
+    )
+}
+
+/// The `files_split` that puts the Agents/Files divider on `row`, clamped so
+/// both sections keep their minimum heights. `None` when nothing can move.
+pub(crate) fn files_split_for_divider_row(
+    area: Rect,
+    split_ratio: f32,
+    footer_rows: u16,
+    row: u16,
+) -> Option<f32> {
+    let (_, detail) = expanded_sidebar_sections(area, split_ratio, footer_rows);
+    let budget = files_split_budget(detail.height)?;
+    if budget.flexible == 0 {
+        return None;
+    }
+    let agent_height = row.saturating_sub(detail.y);
+    let extra = agent_height
+        .saturating_sub(AGENTS_MIN_ROWS)
+        .min(budget.flexible);
+    Some(f32::from(extra) / f32::from(budget.flexible))
 }
 
 fn agent_panel_sort_label(sort: AgentPanelSort) -> &'static str {
@@ -844,7 +1013,7 @@ pub(crate) fn collapsed_sidebar_sections(area: Rect) -> (Rect, Option<u16>, Rect
     (ws_area, Some(divider_y), detail_area)
 }
 
-fn workspace_selection_background(p: &Palette, is_active: bool) -> Color {
+pub(super) fn workspace_selection_background(p: &Palette, is_active: bool) -> Color {
     if is_active && p.selection_bg == Color::Reset {
         p.active_row_bg
     } else {
@@ -1104,11 +1273,26 @@ pub(super) fn render_sidebar(
     }
 
     let footer_rows = sidebar_footer_rows(app);
-    let (ws_area, detail_area) =
-        expanded_sidebar_sections(area, app.sidebar_section_split, footer_rows);
+    let (ws_area, _) = expanded_sidebar_sections(area, app.sidebar_section_split, footer_rows);
+    let (agent_area, files_area, files_divider) = sidebar_files_layout(
+        area,
+        app.sidebar_section_split,
+        footer_rows,
+        app.files_split,
+    );
 
     render_workspace_list(app, terminal_runtimes, frame, ws_area, is_navigating);
-    render_agent_detail(app, terminal_runtimes, frame, detail_area);
+    render_agent_detail(app, terminal_runtimes, frame, agent_area);
+    if files_divider != Rect::default() {
+        frame.render_widget(
+            Paragraph::new(Span::styled(
+                "─".repeat(files_divider.width as usize),
+                Style::default().fg(p.surface_dim),
+            )),
+            files_divider,
+        );
+    }
+    render_files(app, frame, files_area);
     render_sidebar_resources(app, frame, sidebar_footer_rect(area, footer_rows));
     render_sidebar_toggle(app, frame, area, false, p);
 }
@@ -1216,6 +1400,20 @@ fn resource_pressure_style(pressure: ResourcePressure, p: &Palette) -> Style {
     }
 }
 
+/// Theme color for the RAM value at a system memory-pressure level.
+///
+/// Unknown is the failure-safe path and must remain visually identical to
+/// Normal. This pure mapping is independent of both sampling and rendering.
+fn memory_pressure_style(level: MemoryPressureLevel, p: &Palette) -> Style {
+    match level {
+        MemoryPressureLevel::Normal | MemoryPressureLevel::Unknown => {
+            Style::default().fg(p.overlay1)
+        }
+        MemoryPressureLevel::Warning => Style::default().fg(p.yellow),
+        MemoryPressureLevel::Critical => Style::default().fg(p.red).add_modifier(Modifier::BOLD),
+    }
+}
+
 /// Marker glyph and color for the disk row's refresh state.
 ///
 /// Green says the reading was just re-read — including when the number did not
@@ -1298,9 +1496,9 @@ fn render_sidebar_resources(app: &AppState, frame: &mut Frame, area: Rect) {
     };
 
     // CPU and memory ride above disk and swap, and only when the rect the
-    // layout handed down has room for the whole pair. Their values carry no
-    // pressure band and no refresh marker: they move constantly, so colouring
-    // or marking every change would make the footer flicker for no gain.
+    // layout handed down has room for the whole pair. CPU stays neutral; RAM
+    // changes only with macOS's system pressure state, never with its usage
+    // percentage. Neither row carries a refresh marker.
     let extended = area.height >= SIDEBAR_FOOTER_EXTENDED_ROWS;
     let mut rows: Vec<(&str, String, Style, Option<Span<'static>>)> = Vec::new();
     if extended {
@@ -1313,7 +1511,7 @@ fn render_sidebar_resources(app: &AppState, frame: &mut Frame, area: Rect) {
         rows.push((
             "RAM",
             format_memory(app.system_resources.memory, wide),
-            label_style,
+            memory_pressure_style(app.system_resources.memory_pressure, p),
             None,
         ));
     }
@@ -1860,6 +2058,26 @@ fn entry_work_time(app: &AppState, entry: &AgentPanelEntry) -> Option<String> {
     ))
 }
 
+fn agent_name_style(
+    agent: Option<crate::detect::Agent>,
+    permission_mode: Option<crate::terminal::ClaudePermissionMode>,
+    active: bool,
+    p: &Palette,
+) -> Style {
+    let style = if active {
+        Style::default().fg(p.text).add_modifier(Modifier::BOLD)
+    } else {
+        Style::default().fg(p.subtext0).add_modifier(Modifier::BOLD)
+    };
+    if agent == Some(crate::detect::Agent::Claude)
+        && permission_mode == Some(crate::terminal::ClaudePermissionMode::Bypass)
+    {
+        style.fg(p.red)
+    } else {
+        style
+    }
+}
+
 /// Whether `row` has room for `time` beside it without eliding anything.
 ///
 /// The time is the first thing to go when a row is tight: a name or a state
@@ -1953,6 +2171,12 @@ fn render_agent_detail(
         } else {
             Style::default()
         };
+        let permission_mode = app
+            .workspaces
+            .get(detail.ws_idx)
+            .and_then(|workspace| workspace.pane_state(detail.pane_id))
+            .and_then(|pane| app.terminals.get(&pane.attached_terminal_id))
+            .and_then(|terminal| terminal.claude_permission_mode);
         let name_style = if is_active {
             Style::default().fg(p.text).add_modifier(Modifier::BOLD)
         } else {
@@ -1964,7 +2188,7 @@ fn render_agent_detail(
         let status_style = Style::default().fg(label_color);
         // Brighter than the section headings and no longer dimmed: the agent
         // name is content, not chrome, and was the hardest row to read.
-        let agent_style = Style::default().fg(p.subtext0);
+        let agent_style = agent_name_style(detail.agent, permission_mode, false, p);
         // The tab name is how a person says which project a row belongs to, so
         // it carries the one warm accent in the list rather than the same
         // muted color as everything around it.
@@ -2117,6 +2341,36 @@ mod tests {
             .content
             .iter()
             .all(|cell| cell.bg == app.palette.sidebar_bg));
+    }
+
+    #[test]
+    fn bypass_only_recolors_claude_name_and_preserves_modifiers() {
+        let palette = crate::app::state::Palette::catppuccin();
+        let active = agent_name_style(
+            Some(Agent::Claude),
+            Some(crate::terminal::ClaudePermissionMode::Bypass),
+            true,
+            &palette,
+        );
+        assert_eq!(active.fg, Some(palette.red));
+        assert!(active.add_modifier.contains(Modifier::BOLD));
+
+        let standard = agent_name_style(
+            Some(Agent::Claude),
+            Some(crate::terminal::ClaudePermissionMode::Standard),
+            false,
+            &palette,
+        );
+        assert_eq!(standard.fg, Some(palette.subtext0));
+        assert!(standard.add_modifier.contains(Modifier::BOLD));
+
+        let codex = agent_name_style(
+            Some(Agent::Codex),
+            Some(crate::terminal::ClaudePermissionMode::Bypass),
+            false,
+            &palette,
+        );
+        assert_eq!(codex.fg, Some(palette.subtext0));
     }
 
     #[test]
@@ -4613,7 +4867,8 @@ rows = [[{ token = "git_status", fg = "#123456" }]]
     #[test]
     fn cpu_and_memory_are_neutral_and_carry_no_marker() {
         let palette = crate::app::state::Palette::catppuccin();
-        let app = app_with_full_readings(Some(100), Some((GIB * 15, GIB * 16)));
+        let mut app = app_with_full_readings(Some(100), Some((GIB * 15, GIB * 16)));
+        app.system_resources.memory_pressure = MemoryPressureLevel::Normal;
         let area = Rect::new(0, 0, 26, 24);
         let buffer = render_sidebar_to_buffer(&app, area);
         let footer = sidebar_footer_rect(area, sidebar_footer_rows(&app));
@@ -4633,6 +4888,52 @@ rows = [[{ token = "git_status", fg = "#123456" }]]
             }
             assert!(!text.contains('✓'), "{text:?} carries a refresh marker");
             assert!(!text.contains('!'), "{text:?} carries a refresh marker");
+        }
+    }
+
+    #[test]
+    fn memory_pressure_style_uses_existing_palette_and_unknown_is_normal() {
+        let palette = crate::app::state::Palette::catppuccin();
+        let normal = memory_pressure_style(MemoryPressureLevel::Normal, &palette);
+        let unknown = memory_pressure_style(MemoryPressureLevel::Unknown, &palette);
+        let warning = memory_pressure_style(MemoryPressureLevel::Warning, &palette);
+        let critical = memory_pressure_style(MemoryPressureLevel::Critical, &palette);
+
+        assert_eq!(normal, Style::default().fg(palette.overlay1));
+        assert_eq!(unknown, normal);
+        assert_eq!(warning, Style::default().fg(palette.yellow));
+        assert_eq!(critical.fg, Some(palette.red));
+        assert!(critical.add_modifier.contains(Modifier::BOLD));
+    }
+
+    #[test]
+    fn memory_pressure_changes_only_the_ram_value_style() {
+        let palette = crate::app::state::Palette::catppuccin();
+        let area = Rect::new(0, 0, 26, 24);
+
+        for (pressure, expected, bold) in [
+            (MemoryPressureLevel::Warning, palette.yellow, false),
+            (MemoryPressureLevel::Critical, palette.red, true),
+        ] {
+            let mut app = app_with_full_readings(Some(14), Some((GIB * 15, GIB * 16)));
+            app.system_resources.memory_pressure = pressure;
+            let buffer = render_sidebar_to_buffer(&app, area);
+            let footer = sidebar_footer_rect(area, sidebar_footer_rows(&app));
+
+            let cpu_value = &buffer[(7, footer.y + 1)];
+            let ram_label = &buffer[(1, footer.y + 2)];
+            let ram_value = &buffer[(7, footer.y + 2)];
+            let ssd_value = &buffer[(7, footer.y + 3)];
+            let swap_value = &buffer[(7, footer.y + 4)];
+
+            assert_eq!(cpu_value.fg, palette.overlay1);
+            assert_eq!(ram_label.fg, palette.overlay1);
+            assert_eq!(ram_value.fg, expected);
+            assert_eq!(ram_value.modifier.contains(Modifier::BOLD), bold);
+            assert_eq!(ssd_value.fg, palette.overlay1);
+            assert_eq!(swap_value.fg, palette.overlay1);
+
+            assert_eq!(row_text(&buffer, footer.y + 2, 25), " RAM   15.0/16 GB");
         }
     }
 
@@ -5407,11 +5708,19 @@ rows = [[{ token = "git_status", fg = "#123456" }]]
     #[test]
     fn the_tab_accent_is_the_only_thing_recolored_on_the_row() {
         let app = app_with_named_tabs(&["CoreBeasts"]);
-        let area = Rect::new(0, 0, 26, 26);
+        // The lower sidebar is shared by Agents and Files (which reserves its
+        // details rows), so use a sidebar tall enough for four agent body rows
+        // and the real Agents rect from the layout.
+        let area = Rect::new(0, 0, 26, 40);
         let buffer = render_sidebar_to_buffer(&app, area);
-        let (_, agent_area) =
-            expanded_sidebar_sections(area, app.sidebar_section_split, sidebar_footer_rows(&app));
+        let (agent_area, _, _) = sidebar_files_layout(
+            area,
+            app.sidebar_section_split,
+            sidebar_footer_rows(&app),
+            app.files_split,
+        );
         let body = agent_panel_body_rect(agent_area, false);
+        assert!(body.height >= 4);
         let p = &app.palette;
         let y = body.y + 2;
 

@@ -2,7 +2,7 @@
 # managed by herdr; reinstalling or updating the integration overwrites this file.
 # add custom hooks beside this file instead of editing it.
 # HERDR_INTEGRATION_ID=claude
-# HERDR_INTEGRATION_VERSION=8
+# HERDR_INTEGRATION_VERSION=9
 
 param([string]$Action = "")
 
@@ -44,6 +44,12 @@ try {
     }
     if ($payload.hook_event_name -eq "SessionStart" -and $payload.source -is [string] -and -not [string]::IsNullOrWhiteSpace($payload.source)) {
         $args += @("--session-start-source", "$($payload.source)")
+    }
+    if ($payload.permission_mode -is [string] -and -not [string]::IsNullOrWhiteSpace($payload.permission_mode)) {
+        $args += @("--permission-mode", "$($payload.permission_mode)")
+    }
+    if ($payload.hook_event_name -eq "SessionEnd") {
+        $args += @("--session-end")
     }
     & $herdr @args 2>$null | Out-Null
 } catch {

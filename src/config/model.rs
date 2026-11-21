@@ -845,6 +845,21 @@ pub enum TabBarPositionConfig {
     Bottom,
 }
 
+/// Accepts any TOML value for a 0..=1 ratio: numbers are clamped, while
+/// non-numbers, NaN and infinities become `None` instead of failing the load.
+fn deserialize_lenient_ratio<'de, D>(deserializer: D) -> Result<Option<f32>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let value = toml::Value::deserialize(deserializer)?;
+    let number = match value {
+        toml::Value::Float(value) => value,
+        toml::Value::Integer(value) => value as f64,
+        _ => return Ok(None),
+    };
+    Ok(number.is_finite().then(|| number.clamp(0.0, 1.0) as f32))
+}
+
 #[derive(Debug, Deserialize)]
 #[serde(default)]
 pub struct UiConfig {
@@ -900,6 +915,18 @@ pub struct UiConfig {
     pub window_title: String,
     /// Agent sidebar ordering. Saved values are "spaces" or "priority". Default: "spaces".
     pub agent_panel_sort: AgentPanelSortConfig,
+    /// Share of the resizable lower-sidebar rows given to the Agents list
+    /// (the Files tree gets the rest). Written when the Agents/Files divider
+    /// is dragged. Missing, non-numeric or non-finite values fall back to the
+    /// default; out-of-range values are clamped to 0.0..=1.0.
+    #[serde(deserialize_with = "deserialize_lenient_ratio")]
+    pub files_split: Option<f32>,
+    /// Share of the sidebar section rows (above the resource footer) given to
+    /// the Spaces list. Written when the Spaces/Agents divider is dragged.
+    /// Same leniency as `files_split`; minimum section heights are applied
+    /// at layout time.
+    #[serde(deserialize_with = "deserialize_lenient_ratio")]
+    pub spaces_split: Option<f32>,
     /// Retired setting that Herdr wrote before the workspace filter was removed.
     #[serde(rename = "agent_panel_scope")]
     _legacy_agent_panel_scope: Option<LegacyAgentPanelScopeConfig>,
@@ -1127,6 +1154,8 @@ impl Default for UiConfig {
             tab_bar_right_separator: " ".into(),
             window_title: super::window_title::default_window_title(),
             agent_panel_sort: AgentPanelSortConfig::Spaces,
+            files_split: None,
+            spaces_split: None,
             _legacy_agent_panel_scope: None,
             status_indicators: StatusIndicatorStyle::Dots,
             sidebar: SidebarConfig::default(),
@@ -1342,6 +1371,57 @@ resume_agents_on_restore = false
 "#;
         let config: Config = toml::from_str(toml).unwrap();
         assert!(!config.session.resume_agents_on_restore);
+    }
+
+    #[test]
+    fn files_split_config_is_lenient_and_backward_compatible() {
+        assert_eq!(Config::default().ui.files_split, None);
+        let parse = |body: &str| -> Option<f32> {
+            let config: Config = toml::from_str(&format!("[ui]\n{body}\n")).unwrap();
+            config.ui.files_split
+        };
+        // Older configs without the key.
+        assert_eq!(parse("agent_panel_sort = \"priority\""), None);
+        assert_eq!(parse("files_split = 0.3"), Some(0.3));
+        assert_eq!(parse("files_split = 1"), Some(1.0));
+        assert_eq!(parse("files_split = 2.5"), Some(1.0));
+        assert_eq!(parse("files_split = -1"), Some(0.0));
+        for invalid in [
+            "files_split = \"wide\"",
+            "files_split = true",
+            "files_split = nan",
+            "files_split = inf",
+            "files_split = -inf",
+            "files_split = [0.5]",
+        ] {
+            assert_eq!(parse(invalid), None, "{invalid}");
+        }
+    }
+
+    #[test]
+    fn spaces_split_config_is_lenient_and_independent_of_files_split() {
+        assert_eq!(Config::default().ui.spaces_split, None);
+        let parse = |body: &str| -> (Option<f32>, Option<f32>) {
+            let config: Config = toml::from_str(&format!("[ui]\n{body}\n")).unwrap();
+            (config.ui.spaces_split, config.ui.files_split)
+        };
+        // Configs written before spaces_split existed keep their files_split.
+        assert_eq!(parse("files_split = 0.25"), (None, Some(0.25)));
+        assert_eq!(
+            parse("spaces_split = 0.4\nfiles_split = 0.6"),
+            (Some(0.4), Some(0.6))
+        );
+        assert_eq!(parse("spaces_split = 3"), (Some(1.0), None));
+        assert_eq!(parse("spaces_split = -2"), (Some(0.0), None));
+        for invalid in [
+            "spaces_split = \"tall\"",
+            "spaces_split = false",
+            "spaces_split = nan",
+            "spaces_split = inf",
+            "spaces_split = {}",
+        ] {
+            assert_eq!(parse(invalid).0, None, "{invalid}");
+        }
     }
 
     #[test]

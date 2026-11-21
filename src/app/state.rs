@@ -820,6 +820,9 @@ pub struct ViewState {
     pub toast_hit_area: Rect,
     pub pane_infos: Vec<PaneInfo>,
     pub split_borders: Vec<SplitBorder>,
+    pub files_geometry: Option<crate::ui::FilesHitGeometry>,
+    /// Agents/Files divider row, the hitbox for resizing the split.
+    pub files_divider_rect: Rect,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1171,7 +1174,27 @@ pub(crate) enum DragTarget {
         grab_row_offset: u16,
     },
     SidebarDivider,
-    SidebarSectionDivider,
+    /// Spaces/Agents or Agents/Files divider. `start_split` restores the
+    /// split on Esc and decides whether the release needs saving.
+    FilesSplitDivider {
+        divider: SidebarSplitDivider,
+        start_split: f32,
+        /// Row of the Down that started the drag.
+        start_row: u16,
+        /// Row of the last applied `Drag(Left)` (the start row before any).
+        last_drag_row: u16,
+        /// For trace timing (gaps reveal OS drag-lock / three-finger drag).
+        started_at: std::time::Instant,
+    },
+}
+
+/// The two persisted horizontal dividers of the expanded sidebar.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SidebarSplitDivider {
+    /// Between Spaces and Agents (`sidebar_section_split`, `[ui] spaces_split`).
+    Spaces,
+    /// Between Agents and Files (`files_split`, `[ui] files_split`).
+    Files,
 }
 
 /// Active mouse drag on a split border or sidebar divider.
@@ -1424,6 +1447,10 @@ pub struct AppState {
     pub copy_mode: Option<CopyModeState>,
     pub workspace_scroll: usize,
     pub agent_panel_scroll: usize,
+    /// Files sidebar state is keyed by pane identity, not cwd, so equal
+    /// working directories in separate panes never share selection or scroll.
+    pub files_by_pane: std::collections::HashMap<crate::layout::PaneId, crate::ui::FilesPaneState>,
+    pub files_focus: Option<crate::layout::PaneId>,
     pub tab_scroll: usize,
     pub tab_scroll_follow_active: bool,
     pub mobile_switcher_scroll: usize,
@@ -1445,6 +1472,7 @@ pub struct AppState {
     pub toast: Option<ToastNotification>,
     pub pending_agent_notifications: std::collections::HashMap<PaneId, PendingAgentNotification>,
     pub copy_feedback: Option<CopyFeedback>,
+    pub clipboard_feedback_override: Option<String>,
     /// Last reported focus state for the outer terminal hosting herdr.
     /// None means unsupported or not yet reported, which preserves active-pane suppression.
     pub outer_terminal_focus: Option<bool>,
@@ -1464,6 +1492,16 @@ pub struct AppState {
     pub sidebar_collapsed_mode: crate::config::SidebarCollapsedModeConfig,
     /// Ratio of sidebar height allocated to the workspaces section.
     pub sidebar_section_split: f32,
+    /// Share of the resizable lower-sidebar rows given to Agents (vs Files).
+    pub files_split: f32,
+    /// `files_split` as last read from or written to the config file, so an
+    /// unchanged split is never rewritten.
+    pub files_split_saved: Option<f32>,
+    /// `sidebar_section_split` as last read from or written to the config
+    /// file (`[ui] spaces_split`).
+    pub spaces_split_saved: Option<f32>,
+    /// Pressed Files action button (presentation only).
+    pub files_button_press: Option<crate::ui::files::FilesButtonPress>,
     pub agent_panel_sort: AgentPanelSort,
     pub status_indicators: crate::config::StatusIndicatorStyle,
     /// Transient session-wide projection override for the built-in Agents view.
@@ -1819,6 +1857,8 @@ impl AppState {
             copy_mode: None,
             workspace_scroll: 0,
             agent_panel_scroll: 0,
+            files_by_pane: std::collections::HashMap::new(),
+            files_focus: None,
             tab_scroll: 0,
             tab_scroll_follow_active: true,
             mobile_switcher_scroll: 0,
@@ -1837,6 +1877,8 @@ impl AppState {
                 toast_hit_area: Rect::default(),
                 pane_infos: Vec::new(),
                 split_borders: Vec::new(),
+                files_geometry: None,
+                files_divider_rect: Rect::default(),
             },
             drag: None,
             workspace_presses: std::collections::HashMap::new(),
@@ -1852,6 +1894,7 @@ impl AppState {
             toast: None,
             pending_agent_notifications: std::collections::HashMap::new(),
             copy_feedback: None,
+            clipboard_feedback_override: None,
             outer_terminal_focus: None,
             prefix_code: KeyCode::Char('b'),
             prefix_mods: KeyModifiers::CONTROL,
@@ -1869,6 +1912,10 @@ impl AppState {
             sidebar_collapsed: false,
             sidebar_collapsed_mode: crate::config::SidebarCollapsedModeConfig::Compact,
             sidebar_section_split: 0.5,
+            files_split: crate::ui::sanitize_files_split(None),
+            files_split_saved: None,
+            spaces_split_saved: None,
+            files_button_press: None,
             agent_panel_sort: AgentPanelSort::Spaces,
             status_indicators: crate::config::StatusIndicatorStyle::Dots,
             agent_view_override: None,

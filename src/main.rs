@@ -807,10 +807,13 @@ fn main() -> io::Result<()> {
         return Ok(());
     }
 
+    let no_session = args.iter().any(|a| a == "--no-session");
+    if no_session {
+        crate::app::files_trace::startup(true);
+    }
+
     let loaded_config = config::Config::load();
     exit_if_nested_disabled(&loaded_config.config);
-
-    let no_session = args.iter().any(|a| a == "--no-session");
 
     // Auto-detect launch: when --no-session is NOT set, use server/client mode.
     // Check if a server is running, spawn one if needed, then attach as client.
@@ -857,6 +860,7 @@ fn main() -> io::Result<()> {
             DisableBracketedPaste,
             DisableMouseCapture
         );
+        crate::app::files_trace::terminal_restored(true);
         let _ = crate::terminal_modes::clear_host_mouse_reporting(&mut io::stdout());
         let _ = set_host_color_scheme_reports(false);
         let _ = pop_keyboard_enhancement_flags();
@@ -898,6 +902,9 @@ fn main() -> io::Result<()> {
             std::io::stdout().flush()?;
         }
 
+        crate::app::files_trace::terminal_initialized(true, true, true, config.ui.mouse_capture);
+        crate::app::files_trace::event_loop_started(true, true, true, config.ui.mouse_capture);
+
         let mut app = app::App::new(
             config,
             true, // no_session — monolithic mode never saves/restores sessions
@@ -924,6 +931,7 @@ fn main() -> io::Result<()> {
             DisableBracketedPaste,
             DisableMouseCapture
         )?;
+        crate::app::files_trace::terminal_restored(true);
         crate::terminal_modes::clear_host_mouse_reporting(&mut io::stdout())?;
         set_host_color_scheme_reports(false)?;
         ratatui::restore();

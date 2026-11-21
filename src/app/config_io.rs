@@ -105,6 +105,74 @@ impl App {
         }
     }
 
+    /// Saves the Agents/Files split under `[ui] files_split`. Only the one
+    /// key is rewritten; the rest of the file (comments, unknown keys) is kept.
+    /// The live config is not reloaded, so nothing else in the UI changes.
+    pub(super) fn save_files_split(&mut self, split: f32) {
+        let split = crate::ui::sanitize_files_split(Some(split));
+        if self
+            .state
+            .files_split_saved
+            .is_some_and(|saved| (saved - split).abs() < 0.0005)
+        {
+            trace_files_persistence("config-write-skipped-unchanged", split);
+            return;
+        }
+        let saved = self.update_config_file("files split", |content| {
+            crate::config::upsert_section_value(
+                content,
+                "ui",
+                "files_split",
+                &format!("{split:.3}"),
+            )
+        });
+        if saved {
+            self.state.files_split_saved = Some(split);
+        }
+        trace_files_persistence(
+            if saved {
+                "config-write-ok"
+            } else {
+                "config-write-failed"
+            },
+            split,
+        );
+    }
+
+    /// Saves the Spaces/Agents split under `[ui] spaces_split`, the same way
+    /// as [`Self::save_files_split`].
+    pub(super) fn save_spaces_split(&mut self, split: f32) {
+        let split = crate::ui::sanitize_spaces_split(Some(split));
+        if self
+            .state
+            .spaces_split_saved
+            .is_some_and(|saved| (saved - split).abs() < 0.0005)
+        {
+            trace_split_persistence("config-write-skipped-unchanged", "spaces_split", split);
+            return;
+        }
+        let saved = self.update_config_file("spaces split", |content| {
+            crate::config::upsert_section_value(
+                content,
+                "ui",
+                "spaces_split",
+                &format!("{split:.4}"),
+            )
+        });
+        if saved {
+            self.state.spaces_split_saved = Some(split);
+        }
+        trace_split_persistence(
+            if saved {
+                "config-write-ok"
+            } else {
+                "config-write-failed"
+            },
+            "spaces_split",
+            split,
+        );
+    }
+
     pub(super) fn save_agent_panel_sort(&mut self, sort: crate::app::state::AgentPanelSort) {
         let value = match sort {
             crate::app::state::AgentPanelSort::Spaces => {
@@ -124,5 +192,21 @@ impl App {
         }) {
             self.apply_config_from_disk(false);
         }
+    }
+}
+
+fn trace_files_persistence(event: &str, split: f32) {
+    trace_split_persistence(event, "files_split", split);
+}
+
+fn trace_split_persistence(event: &str, key: &str, split: f32) {
+    if super::input::files_trace::enabled() {
+        super::input::files_trace::state_change(
+            event,
+            &format!("{}-persistence", key.replace('_', "-")),
+            "-",
+            &format!("path={:?}", crate::config::config_path()),
+            &format!("[ui] {key}={split:.4}"),
+        );
     }
 }

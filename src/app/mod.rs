@@ -18,6 +18,53 @@ mod creation;
 mod git_refresh;
 mod ids;
 mod input;
+
+/// `HERDR_FILES_TRACE_PATH` diagnostics for code outside `app` (the session
+/// server's Files task). No-ops unless the variable is set.
+pub(crate) fn files_trace_enabled() -> bool {
+    input::files_trace::enabled()
+}
+
+pub(crate) fn files_trace_state_change(event: &str, reason: &str, before: &str, after: &str) {
+    input::files_trace::state_change(event, reason, "-", before, after);
+}
+
+/// `HERDR_FILES_TRACE_PATH` only: where `[ui] files_split` / `spaces_split`
+/// were read from, their raw TOML values, what deserialization kept and what
+/// the layout will use.
+fn trace_files_split_config_read(config: &Config) {
+    if !input::files_trace::enabled() {
+        return;
+    }
+    let path = crate::config::config_path();
+    let table = std::fs::read_to_string(&path)
+        .ok()
+        .and_then(|text| text.parse::<toml::Table>().ok());
+    let raw = |key: &str| {
+        table
+            .as_ref()
+            .and_then(|table| table.get("ui")?.get(key).cloned())
+            .map_or_else(|| "<missing>".to_string(), |value| value.to_string())
+    };
+    input::files_trace::state_change(
+        "config-read",
+        "split-persistence",
+        "-",
+        &format!(
+            "path={path:?} files_split raw={} parsed={:?} spaces_split raw={} parsed={:?}",
+            raw("files_split"),
+            config.ui.files_split,
+            raw("spaces_split"),
+            config.ui.spaces_split,
+        ),
+        &format!(
+            "validated files_split={:.4} spaces_split={:.4}",
+            crate::ui::sanitize_files_split(config.ui.files_split),
+            crate::ui::sanitize_spaces_split(config.ui.spaces_split),
+        ),
+    );
+}
+pub(crate) use input::files_trace;
 pub(crate) mod pane_graphics;
 mod popup;
 mod runtime;
@@ -145,6 +192,8 @@ pub struct App {
     pub(crate) pending_agent_resume_deadline: Option<Instant>,
     pub(crate) selection_autoscroll_deadline: Option<Instant>,
     pub(crate) selection_highlight_clear_deadline: Option<Instant>,
+    /// Pane whose Files root was last synchronized (detects pane switches).
+    pub(crate) files_synced_pane: Option<crate::layout::PaneId>,
     pub(crate) session_save_deadline: Option<Instant>,
     pub(crate) session_save_thread: Option<std::thread::JoinHandle<()>>,
     pub(crate) detached_process_children: Vec<std::process::Child>,
@@ -391,6 +440,7 @@ impl App {
         api_rx: tokio::sync::mpsc::UnboundedReceiver<crate::api::ApiRequestMessage>,
         event_hub: crate::api::EventHub,
     ) -> Self {
+        trace_files_split_config_read(config);
         let (prefix_code, prefix_mods) = config.prefix_key();
         crate::kitty_graphics::set_enabled(config.experimental.kitty_graphics);
         let (event_tx, event_rx) = mpsc::channel::<AppEvent>(APP_EVENT_CHANNEL_CAPACITY);
@@ -592,6 +642,8 @@ impl App {
             copy_mode: None,
             workspace_scroll: 0,
             agent_panel_scroll: 0,
+            files_by_pane: std::collections::HashMap::new(),
+            files_focus: None,
             tab_scroll: 0,
             tab_scroll_follow_active: true,
             mobile_switcher_scroll: 0,
@@ -610,6 +662,8 @@ impl App {
                 toast_hit_area: Rect::default(),
                 pane_infos: Vec::new(),
                 split_borders: Vec::new(),
+                files_geometry: None,
+                files_divider_rect: Rect::default(),
             },
             drag: None,
             workspace_presses: HashMap::new(),
@@ -625,6 +679,7 @@ impl App {
             toast: None,
             pending_agent_notifications: std::collections::HashMap::new(),
             copy_feedback: None,
+            clipboard_feedback_override: None,
             outer_terminal_focus: None,
             prefix_code,
             prefix_mods,
@@ -638,7 +693,18 @@ impl App {
             sidebar_width_auto: false,
             sidebar_collapsed: config.ui.sidebar_start_collapsed,
             sidebar_collapsed_mode: config.ui.sidebar_collapsed_mode,
-            sidebar_section_split,
+            // A saved [ui] spaces_split wins over the session snapshot, so
+            // --no-session and session mode restore the same heights.
+            sidebar_section_split: config
+                .ui
+                .spaces_split
+                .map_or(sidebar_section_split, |split| {
+                    crate::ui::sanitize_spaces_split(Some(split))
+                }),
+            files_split: crate::ui::sanitize_files_split(config.ui.files_split),
+            files_split_saved: config.ui.files_split,
+            spaces_split_saved: config.ui.spaces_split,
+            files_button_press: None,
             agent_panel_sort,
             status_indicators: config.ui.status_indicators,
             agent_view_override: None,
@@ -647,7 +713,13 @@ impl App {
             sidebar_resources: config.ui.sidebar.resources.clone(),
             work_timers: work_timer::WorkTimers::default(),
             work_clock: None,
-            system_resources: system_resources::SystemResources::default(),
+            // The footer keeps its rows from the first frame, so the first
+            // reading never shifts the Spaces/Agents/Files dividers.
+            system_resources: system_resources::SystemResources {
+                // Unit tests drive sampling explicitly, so they start without it.
+                awaiting_first_sample: !cfg!(test),
+                ..system_resources::SystemResources::default()
+            },
             next_agent_state_change_seq: 0,
             mouse_capture: config.ui.mouse_capture,
             copy_on_select: config.ui.copy_on_select,
@@ -785,6 +857,7 @@ impl App {
             loaded_host_cursor: config.ui.host_cursor,
             agent_metadata_deadline: None,
             pending_agent_resume_deadline: None,
+            files_synced_pane: None,
             session_save_deadline: None,
             session_save_thread: None,
             detached_process_children: Vec::new(),
@@ -873,7 +946,9 @@ impl App {
             app.state.sidebar_width_source = state::SidebarWidthSource::Persisted;
         }
         if let Some(split) = snapshot.sidebar_section_split {
-            app.state.sidebar_section_split = split;
+            if app.state.spaces_split_saved.is_none() {
+                app.state.sidebar_section_split = split;
+            }
         }
         app.state.collapsed_space_keys = snapshot.collapsed_space_keys.clone();
         app.state.mode = if app.state.active.is_some() {
@@ -1519,6 +1594,13 @@ impl App {
                 self.configure_window_title(&config.ui.window_title);
                 self.state.agent_panel_sort =
                     agent_panel_sort_from_config(config.ui.agent_panel_sort);
+                self.state.files_split = crate::ui::sanitize_files_split(config.ui.files_split);
+                self.state.files_split_saved = config.ui.files_split;
+                if let Some(split) = config.ui.spaces_split {
+                    self.state.sidebar_section_split =
+                        crate::ui::sanitize_spaces_split(Some(split));
+                }
+                self.state.spaces_split_saved = config.ui.spaces_split;
                 self.state.status_indicators = config.ui.status_indicators;
                 self.state.sidebar_agents = config.ui.sidebar.agents.clone();
                 self.state.sidebar_spaces = config.ui.sidebar.spaces.clone();
@@ -1787,6 +1869,10 @@ impl App {
                     let lease_key = input::InputLeaseKey::new(source_id, &key);
                     let key = self.input_leases.normalize_press(&lease_key, key);
                     match key.kind {
+                        crossterm::event::KeyEventKind::Press
+                        | crossterm::event::KeyEventKind::Repeat
+                            if self.state.popup_pane.is_none()
+                                && self.handle_files_overlay_key(&key.as_key_event()) => {}
                         crossterm::event::KeyEventKind::Press => {
                             let initial_context = self.terminal_input_context();
                             let target = if initial_context.is_some() {
@@ -1826,7 +1912,24 @@ impl App {
                     self.handle_text_commit_headless(text.as_str());
                 }
                 crate::raw_input::RawInputEvent::Mouse(mouse) => {
-                    if self.state.popup_pane.is_some() || self.state.mouse_capture {
+                    let sidebar = self.state.view.sidebar_rect;
+                    let in_files_geometry =
+                        self.state
+                            .view
+                            .files_geometry
+                            .as_ref()
+                            .is_some_and(|geometry| {
+                                geometry.area.contains((mouse.column, mouse.row).into())
+                            });
+                    let in_sidebar = sidebar.width > 0
+                        && sidebar.height > 0
+                        && sidebar.contains((mouse.column, mouse.row).into());
+                    if self.state.popup_pane.is_some()
+                        || self.state.mouse_capture
+                        || self.state.drag.is_some()
+                        || in_sidebar
+                        || in_files_geometry
+                    {
                         self.handle_mouse_event_headless(source_id, mouse);
                     } else {
                         self.state
@@ -3634,6 +3737,712 @@ mod tests {
 
         std::env::remove_var(crate::config::CONFIG_PATH_ENV_VAR);
         let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    fn files_split_app(config: &Config) -> App {
+        let (_api_tx, api_rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut app = App::new(config, true, None, api_rx, crate::api::EventHub::default());
+        app.state.update_available = None;
+        app.state.latest_release_notes_available = false;
+        app.state.workspaces = vec![Workspace::test_new("split")];
+        app.state.active = Some(0);
+        app.state.mode = Mode::Terminal;
+        crate::ui::compute_view(&mut app.state, ratatui::layout::Rect::new(0, 0, 106, 60));
+        app
+    }
+
+    fn files_split_mouse(
+        kind: crossterm::event::MouseEventKind,
+        rect: ratatui::layout::Rect,
+        row: u16,
+    ) -> crossterm::event::MouseEvent {
+        crossterm::event::MouseEvent {
+            kind,
+            column: rect.x + rect.width / 2,
+            row,
+            modifiers: KeyModifiers::empty(),
+        }
+    }
+
+    #[test]
+    fn files_split_is_saved_once_on_release_and_restored_after_restart() {
+        use crossterm::event::{MouseButton, MouseEventKind};
+        let _guard = config_env_lock().lock().unwrap();
+        let path = temp_config_path("files-split");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let original = "# my layout notes\nonboarding = false\n[ui]\nmystery_key = 7 # keep me\n";
+        std::fs::write(&path, original).unwrap();
+        std::env::set_var(crate::config::CONFIG_PATH_ENV_VAR, &path);
+
+        let mut app = files_split_app(&crate::config::Config::load().config);
+        assert_eq!(app.state.files_split, crate::ui::sanitize_files_split(None));
+        let divider = app.state.view.files_divider_rect;
+        assert!(divider.height > 0);
+
+        app.handle_mouse(files_split_mouse(
+            MouseEventKind::Down(MouseButton::Left),
+            divider,
+            divider.y,
+        ));
+        for (step, kind) in [
+            MouseEventKind::Drag(MouseButton::Left),
+            MouseEventKind::Drag(MouseButton::Left),
+            MouseEventKind::Drag(MouseButton::Left),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            app.handle_mouse(files_split_mouse(
+                kind,
+                divider,
+                divider.y - 1 - step as u16,
+            ));
+            assert_eq!(
+                std::fs::read_to_string(&path).unwrap(),
+                original,
+                "nothing is written while dragging"
+            );
+        }
+        let dragged = app.state.files_split;
+        assert!(dragged < crate::ui::sanitize_files_split(None));
+        app.handle_mouse(files_split_mouse(
+            MouseEventKind::Up(MouseButton::Left),
+            divider,
+            divider.y - 3,
+        ));
+        let saved = std::fs::read_to_string(&path).unwrap();
+        assert!(
+            saved.contains(&format!("files_split = {dragged:.3}")),
+            "{saved}"
+        );
+        assert!(saved.contains("# my layout notes"));
+        assert!(saved.contains("mystery_key = 7 # keep me"));
+        assert_eq!(app.state.files_split, dragged, "no reload side effects");
+
+        // A click on the divider without moving it writes nothing.
+        std::fs::write(&path, &saved).unwrap();
+        let divider = {
+            crate::ui::compute_view(&mut app.state, ratatui::layout::Rect::new(0, 0, 106, 60));
+            app.state.view.files_divider_rect
+        };
+        app.handle_mouse(files_split_mouse(
+            MouseEventKind::Down(MouseButton::Left),
+            divider,
+            divider.y,
+        ));
+        app.handle_mouse(files_split_mouse(
+            MouseEventKind::Up(MouseButton::Left),
+            divider,
+            divider.y,
+        ));
+        app.save_files_split(dragged);
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), saved);
+
+        // Restart: a fresh App reads the saved ratio and lays out from it.
+        let restarted = files_split_app(&crate::config::Config::load().config);
+        assert!((restarted.state.files_split - dragged).abs() < 0.001);
+        assert_eq!(restarted.state.view.files_divider_rect.y, divider.y);
+
+        std::env::remove_var(crate::config::CONFIG_PATH_ENV_VAR);
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    /// Writes `content` to a fresh temporary config, points HERDR_CONFIG_PATH
+    /// at it and returns the path. The real user config is never touched.
+    fn temp_files_split_config(name: &str, content: &str) -> std::path::PathBuf {
+        let path = temp_config_path(name);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, content).unwrap();
+        std::env::set_var(crate::config::CONFIG_PATH_ENV_VAR, &path);
+        path
+    }
+
+    fn drag_files_divider(app: &mut App, rows: &[i32]) -> ratatui::layout::Rect {
+        use crossterm::event::{MouseButton, MouseEventKind};
+        let divider = app.state.view.files_divider_rect;
+        app.handle_mouse(files_split_mouse(
+            MouseEventKind::Down(MouseButton::Left),
+            divider,
+            divider.y,
+        ));
+        for offset in rows {
+            app.handle_mouse(files_split_mouse(
+                MouseEventKind::Drag(MouseButton::Left),
+                divider,
+                (i32::from(divider.y) + offset) as u16,
+            ));
+        }
+        divider
+    }
+
+    #[test]
+    fn missed_release_ends_the_divider_drag_on_motion_and_esc_cancels_without_saving() {
+        use crossterm::event::{MouseButton, MouseEventKind};
+        let _guard = config_env_lock().lock().unwrap();
+        let path = temp_files_split_config("files-split-motion", "[ui]\n# keep\n");
+        let mut app = files_split_app(&crate::config::Config::load().config);
+
+        // Button released outside our view: the next plain motion ends the
+        // drag at the last dragged row and saves once; later motion is ignored.
+        let divider = drag_files_divider(&mut app, &[-1, -2, -3]);
+        let dropped = app.state.files_split;
+        app.handle_mouse(files_split_mouse(MouseEventKind::Moved, divider, 2));
+        assert!(app.state.drag.is_none());
+        assert_eq!(app.state.files_split, dropped);
+        app.handle_mouse(files_split_mouse(
+            MouseEventKind::Moved,
+            divider,
+            divider.y + 9,
+        ));
+        assert_eq!(
+            app.state.files_split, dropped,
+            "the divider does not follow the pointer"
+        );
+        let saved = std::fs::read_to_string(&path).unwrap();
+        assert!(
+            saved.contains(&format!("files_split = {dropped:.3}")),
+            "{saved}"
+        );
+        assert!(saved.contains("# keep"));
+
+        // Esc cancels: the split returns to its start and nothing is written.
+        crate::ui::compute_view(&mut app.state, ratatui::layout::Rect::new(0, 0, 106, 60));
+        drag_files_divider(&mut app, &[2, 4]);
+        assert_ne!(app.state.files_split, dropped);
+        assert!(
+            app.handle_files_overlay_key(&crossterm::event::KeyEvent::new(
+                crossterm::event::KeyCode::Esc,
+                KeyModifiers::empty(),
+            ))
+        );
+        assert!(app.state.drag.is_none());
+        assert_eq!(app.state.files_split, dropped);
+        app.handle_mouse(files_split_mouse(
+            MouseEventKind::Up(MouseButton::Left),
+            divider,
+            divider.y + 4,
+        ));
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), saved);
+
+        std::env::remove_var(crate::config::CONFIG_PATH_ENV_VAR);
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    #[test]
+    fn saved_files_split_round_trips_through_a_temp_config_at_other_sizes() {
+        use crossterm::event::{MouseButton, MouseEventKind};
+        let _guard = config_env_lock().lock().unwrap();
+        let path = temp_files_split_config(
+            "files-split-roundtrip",
+            "onboarding = false\n[ui]\nagent_panel_sort = \"priority\"\n",
+        );
+        let mut app = files_split_app(&crate::config::Config::load().config);
+        let divider = drag_files_divider(&mut app, &[-2, -4, -6]);
+        app.handle_mouse(files_split_mouse(
+            MouseEventKind::Up(MouseButton::Left),
+            divider,
+            divider.y - 6,
+        ));
+        let dropped = app.state.files_split;
+        let drop_row = {
+            crate::ui::compute_view(&mut app.state, ratatui::layout::Rect::new(0, 0, 106, 60));
+            app.state.view.files_divider_rect.y
+        };
+        assert_eq!(drop_row, divider.y - 6);
+
+        // "Restart": a brand-new App/AppState/ViewState from the reloaded file.
+        let reloaded = crate::config::Config::load().config;
+        assert_eq!(
+            reloaded.ui.agent_panel_sort,
+            crate::config::AgentPanelSortConfig::Priority
+        );
+        let restarted = files_split_app(&reloaded);
+        assert!((restarted.state.files_split - dropped).abs() < 0.001);
+        assert_eq!(restarted.state.view.files_divider_rect.y, drop_row);
+        // A different terminal height recomputes rows from the same ratio.
+        for height in [40u16, 80] {
+            let mut resized = files_split_app(&reloaded);
+            crate::ui::compute_view(
+                &mut resized.state,
+                ratatui::layout::Rect::new(0, 0, 106, height),
+            );
+            let expected = crate::ui::sidebar_files_layout(
+                resized.state.view.sidebar_rect,
+                resized.state.sidebar_section_split,
+                crate::ui::sidebar_footer_rows(&resized.state),
+                dropped,
+            )
+            .2;
+            assert_eq!(
+                resized.state.view.files_divider_rect, expected,
+                "h={height}"
+            );
+        }
+
+        // Releasing without moving writes nothing.
+        let before = std::fs::read_to_string(&path).unwrap();
+        let mut again = files_split_app(&reloaded);
+        let divider = again.state.view.files_divider_rect;
+        again.handle_mouse(files_split_mouse(
+            MouseEventKind::Down(MouseButton::Left),
+            divider,
+            divider.y,
+        ));
+        again.handle_mouse(files_split_mouse(
+            MouseEventKind::Up(MouseButton::Left),
+            divider,
+            divider.y,
+        ));
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), before);
+
+        std::env::remove_var(crate::config::CONFIG_PATH_ENV_VAR);
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    /// Feeds mouse reports through the top-level raw input entry point (the
+    /// same path terminal input takes) on a private current-thread runtime.
+    fn feed_raw_mouse(app: &mut App, events: &[(crossterm::event::MouseEventKind, u16, u16)]) {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            for (kind, column, row) in events {
+                app.handle_raw_input_event(crate::raw_input::RawInputEvent::Mouse(
+                    crossterm::event::MouseEvent {
+                        kind: *kind,
+                        column: *column,
+                        row: *row,
+                        modifiers: KeyModifiers::empty(),
+                    },
+                ))
+                .await;
+            }
+        });
+    }
+
+    /// The Ghostty session in the report: the split starts at 0.0, is dragged
+    /// down, and the pointer then returns to the start. Whether that return is
+    /// reported as button-less motion (release lost) or as a release followed
+    /// by motion, the committed value is the last dragged one, written once.
+    #[test]
+    fn divider_keeps_the_last_dragged_split_when_the_pointer_returns_after_release() {
+        use crossterm::event::{MouseButton, MouseEventKind};
+        let _guard = config_env_lock().lock().unwrap();
+        let path = temp_files_split_config(
+            "files-split-ghostty-series",
+            "# user notes\n[ui]\nfiles_split = 0.0\nagent_panel_sort = \"spaces\"\n",
+        );
+        let app = files_split_app(&crate::config::Config::load().config);
+        assert_eq!(app.state.files_split, 0.0);
+        let divider = app.state.view.files_divider_rect;
+        let column = divider.x + divider.width / 2;
+        let down: Vec<_> = (1..=9)
+            .map(|step| {
+                (
+                    MouseEventKind::Drag(MouseButton::Left),
+                    column,
+                    divider.y + step,
+                )
+            })
+            .collect();
+
+        for return_kind in ["button-less motion", "release then motion"] {
+            std::fs::write(
+                &path,
+                "# user notes\n[ui]\nfiles_split = 0.0\nagent_panel_sort = \"spaces\"\n",
+            )
+            .unwrap();
+            let mut app = files_split_app(&crate::config::Config::load().config);
+            assert_eq!(app.state.files_split, 0.0, "{return_kind}");
+            let original = std::fs::read_to_string(&path).unwrap();
+            let mut events = vec![(MouseEventKind::Down(MouseButton::Left), column, divider.y)];
+            events.extend(down.iter().copied());
+            feed_raw_mouse(&mut app, &events);
+            let peak = app.state.files_split;
+            assert!(peak > 0.0);
+            assert_eq!(
+                std::fs::read_to_string(&path).unwrap(),
+                original,
+                "no write mid-drag"
+            );
+            if return_kind == "release then motion" {
+                feed_raw_mouse(
+                    &mut app,
+                    &[(MouseEventKind::Up(MouseButton::Left), column, divider.y + 9)],
+                );
+            }
+            // The pointer travels back to (and above) the starting row.
+            let back: Vec<_> = (0..=11)
+                .rev()
+                .map(|step| {
+                    (
+                        MouseEventKind::Moved,
+                        column,
+                        divider.y.saturating_sub(2) + step,
+                    )
+                })
+                .collect();
+            feed_raw_mouse(&mut app, &back);
+            assert!(app.state.drag.is_none(), "{return_kind}");
+            assert_eq!(
+                app.state.files_split, peak,
+                "{return_kind}: motion never moves it"
+            );
+            let written = std::fs::read_to_string(&path).unwrap();
+            assert!(
+                written.contains(&format!("files_split = {peak:.3}")),
+                "{return_kind}: {written}"
+            );
+            assert!(written.contains("# user notes") && written.contains("agent_panel_sort"));
+            // Exactly one write: later motion and a stray release change nothing.
+            std::fs::write(&path, format!("{written}# sentinel\n")).unwrap();
+            feed_raw_mouse(
+                &mut app,
+                &[
+                    (MouseEventKind::Moved, column, divider.y),
+                    (MouseEventKind::Up(MouseButton::Left), column, divider.y),
+                ],
+            );
+            assert_eq!(
+                std::fs::read_to_string(&path).unwrap(),
+                format!("{written}# sentinel\n")
+            );
+            // A fresh App/AppState/ViewState reads the same value back.
+            let restarted = files_split_app(&crate::config::Config::load().config);
+            assert!(
+                (restarted.state.files_split - peak).abs() < 0.001,
+                "{return_kind}"
+            );
+        }
+
+        // What Ghostty actually reported: the return trip as held-button
+        // Drag(Left) events and the release back at the start. The divider
+        // follows a held button, ends where it is released and, being
+        // unchanged, writes nothing.
+        std::fs::write(&path, "[ui]\nfiles_split = 0.0\n").unwrap();
+        let mut app = files_split_app(&crate::config::Config::load().config);
+        let mut events = vec![(MouseEventKind::Down(MouseButton::Left), column, divider.y)];
+        events.extend(down.iter().copied());
+        events.extend((0..9).rev().map(|step| {
+            (
+                MouseEventKind::Drag(MouseButton::Left),
+                column,
+                divider.y + step,
+            )
+        }));
+        events.push((MouseEventKind::Up(MouseButton::Left), column, divider.y));
+        feed_raw_mouse(&mut app, &events);
+        assert_eq!(app.state.files_split, 0.0);
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            "[ui]\nfiles_split = 0.0\n"
+        );
+        let _ = app;
+
+        std::env::remove_var(crate::config::CONFIG_PATH_ENV_VAR);
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    #[test]
+    fn divider_release_outside_the_sidebar_commits_and_resources_keep_the_ratio() {
+        use crate::app::system_resources::{ResourcePressure, ResourceReading, SystemResources};
+        use crossterm::event::{MouseButton, MouseEventKind};
+        let _guard = config_env_lock().lock().unwrap();
+        let path = temp_files_split_config("files-split-outside", "[ui]\n");
+        let mut app = files_split_app(&crate::config::Config::load().config);
+        let divider = app.state.view.files_divider_rect;
+        let column = divider.x + divider.width / 2;
+        feed_raw_mouse(
+            &mut app,
+            &[
+                (MouseEventKind::Down(MouseButton::Left), column, divider.y),
+                (
+                    MouseEventKind::Drag(MouseButton::Left),
+                    column,
+                    divider.y - 3,
+                ),
+                (MouseEventKind::Drag(MouseButton::Left), 80, divider.y - 4),
+                (MouseEventKind::Up(MouseButton::Left), 90, 5),
+            ],
+        );
+        assert!(app.state.drag.is_none());
+        let committed = app.state.files_split;
+        let written = std::fs::read_to_string(&path).unwrap();
+        assert!(
+            written.contains(&format!("files_split = {committed:.3}")),
+            "{written}"
+        );
+        // Motion after the release never moves the divider.
+        feed_raw_mouse(&mut app, &[(MouseEventKind::Moved, column, divider.y + 5)]);
+        assert_eq!(app.state.files_split, committed);
+
+        // The resource footer appearing later re-lays out rows but keeps the
+        // saved ratio (and a restarted App gets the same layout).
+        let before_footer = app.state.view.files_divider_rect;
+        app.state.system_resources = SystemResources {
+            disk_available: Some(ResourceReading {
+                bytes: 197_895_245_824,
+                pressure: ResourcePressure::Normal,
+            }),
+            swap_used: Some(ResourceReading {
+                bytes: 0,
+                pressure: ResourcePressure::Normal,
+            }),
+            ..Default::default()
+        };
+        crate::ui::compute_view(&mut app.state, ratatui::layout::Rect::new(0, 0, 106, 60));
+        assert_eq!(app.state.files_split, committed);
+        let with_footer = app.state.view.files_divider_rect;
+        let expected = crate::ui::sidebar_files_layout(
+            app.state.view.sidebar_rect,
+            app.state.sidebar_section_split,
+            crate::ui::sidebar_footer_rows(&app.state),
+            committed,
+        )
+        .2;
+        assert_eq!(with_footer, expected);
+        assert!(with_footer.y <= before_footer.y);
+
+        std::env::remove_var(crate::config::CONFIG_PATH_ENV_VAR);
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    /// (spaces, agents, Agents/Files divider, files) rects as laid out now.
+    fn sidebar_sections(app: &App) -> [ratatui::layout::Rect; 4] {
+        let state = &app.state;
+        let footer = crate::ui::sidebar_footer_rows(state);
+        let (agents, files, divider) = crate::ui::sidebar_files_layout(
+            state.view.sidebar_rect,
+            state.sidebar_section_split,
+            footer,
+            state.files_split,
+        );
+        let spaces = crate::ui::workspace_list_rect(
+            state.view.sidebar_rect,
+            state.sidebar_section_split,
+            footer,
+        );
+        [spaces, agents, divider, files]
+    }
+
+    fn spaces_divider(app: &App) -> ratatui::layout::Rect {
+        crate::ui::sidebar_section_divider_rect(
+            app.state.view.sidebar_rect,
+            app.state.sidebar_section_split,
+            crate::ui::sidebar_footer_rows(&app.state),
+        )
+    }
+
+    /// Files section minimum: header, one tree row, buttons, six detail rows.
+    fn assert_minimum_sections(app: &App) {
+        let [spaces, agents, divider, files] = sidebar_sections(app);
+        assert!(spaces.height >= 4, "spaces {spaces:?}");
+        assert!(agents.height >= 5, "agents {agents:?}");
+        assert_eq!(divider.y, agents.y + agents.height);
+        assert_eq!(files.y, divider.y + 1);
+        let layout = crate::ui::files::files_section_layout(files);
+        assert!(layout.tree.height >= 1);
+        assert_eq!(layout.details.height, crate::ui::files::FILES_DETAILS_ROWS);
+        assert!(spaces.y + spaces.height <= agents.y, "dividers never cross");
+    }
+
+    #[test]
+    fn spaces_and_files_splits_persist_and_restore_all_three_sections() {
+        use crossterm::event::{MouseButton, MouseEventKind};
+        let _guard = config_env_lock().lock().unwrap();
+        // An older config: it already has files_split but no spaces_split.
+        let original =
+            "# keep this comment\nonboarding = false\n[ui]\nfiles_split = 0.300\nmystery = \"x\" # mine\n";
+        let path = temp_files_split_config("spaces-split", original);
+        let mut app = files_split_app(&crate::config::Config::load().config);
+        assert!(
+            (app.state.files_split - 0.3).abs() < 0.0001,
+            "backward compatible"
+        );
+        assert_eq!(app.state.sidebar_section_split, 0.5);
+        let start = sidebar_sections(&app);
+        let divider = spaces_divider(&app);
+        let column = divider.x + divider.width / 2;
+
+        // Drag the Spaces/Agents divider down 6 rows: nothing written meanwhile.
+        feed_raw_mouse(
+            &mut app,
+            &[
+                (MouseEventKind::Down(MouseButton::Left), column, divider.y),
+                (
+                    MouseEventKind::Drag(MouseButton::Left),
+                    column,
+                    divider.y + 3,
+                ),
+                (
+                    MouseEventKind::Drag(MouseButton::Left),
+                    column,
+                    divider.y + 6,
+                ),
+            ],
+        );
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), original);
+        feed_raw_mouse(
+            &mut app,
+            &[
+                (MouseEventKind::Up(MouseButton::Left), 90, 2),
+                // Motion after the release never moves it.
+                (MouseEventKind::Moved, column, divider.y - 10),
+            ],
+        );
+        assert!(app.state.drag.is_none());
+        let spaces = app.state.sidebar_section_split;
+        assert!(spaces > 0.5);
+        let written = std::fs::read_to_string(&path).unwrap();
+        assert!(
+            written.contains(&format!("spaces_split = {spaces:.4}")),
+            "{written}"
+        );
+        assert!(written.contains("files_split = 0.300"), "{written}");
+        assert!(written.contains("# keep this comment"));
+        assert!(written.contains("mystery = \"x\" # mine"));
+        crate::ui::compute_view(&mut app.state, ratatui::layout::Rect::new(0, 0, 106, 60));
+        let after = sidebar_sections(&app);
+        assert_eq!(after[0].height, start[0].height + 6);
+        assert_minimum_sections(&app);
+
+        // Restart: a fresh App restores all three heights.
+        let restarted = files_split_app(&crate::config::Config::load().config);
+        assert_eq!(sidebar_sections(&restarted), after);
+
+        // A smaller window recomputes from the saved ratios, keeping minimums.
+        let mut small = files_split_app(&crate::config::Config::load().config);
+        crate::ui::compute_view(&mut small.state, ratatui::layout::Rect::new(0, 0, 106, 40));
+        assert_eq!(small.state.sidebar_section_split, spaces);
+        assert_minimum_sections(&small);
+        let [small_spaces, ..] = sidebar_sections(&small);
+        assert!(small_spaces.height < after[0].height);
+
+        std::env::remove_var(crate::config::CONFIG_PATH_ENV_VAR);
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    #[test]
+    fn spaces_divider_clamps_esc_cancels_and_unchanged_release_writes_nothing() {
+        use crossterm::event::{KeyCode, KeyEvent, MouseButton, MouseEventKind};
+        let _guard = config_env_lock().lock().unwrap();
+        let original = "onboarding = false\n[ui]\n";
+        let path = temp_files_split_config("spaces-split-clamp", original);
+        let mut app = files_split_app(&crate::config::Config::load().config);
+        let divider = spaces_divider(&app);
+        let column = divider.x + divider.width / 2;
+
+        // Far past the bottom: clamped so Agents and all of Files survive.
+        feed_raw_mouse(
+            &mut app,
+            &[
+                (MouseEventKind::Down(MouseButton::Left), column, divider.y),
+                (MouseEventKind::Drag(MouseButton::Left), column, 59),
+            ],
+        );
+        assert_minimum_sections(&app);
+        // Esc restores the start and writes nothing.
+        assert!(app.handle_files_overlay_key(&KeyEvent::from(KeyCode::Esc)));
+        assert!(app.state.drag.is_none());
+        assert_eq!(app.state.sidebar_section_split, 0.5);
+        feed_raw_mouse(
+            &mut app,
+            &[(MouseEventKind::Up(MouseButton::Left), column, 59)],
+        );
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), original);
+
+        // Far past the top: Spaces keeps its header and one row.
+        feed_raw_mouse(
+            &mut app,
+            &[
+                (MouseEventKind::Down(MouseButton::Left), column, divider.y),
+                (MouseEventKind::Drag(MouseButton::Left), column, 0),
+                (MouseEventKind::Up(MouseButton::Left), column, 0),
+            ],
+        );
+        assert_eq!(sidebar_sections(&app)[0].height, 4);
+        assert_minimum_sections(&app);
+        let written = std::fs::read_to_string(&path).unwrap();
+        assert!(written.contains("spaces_split = "), "{written}");
+
+        // A click on the divider that does not move it writes nothing.
+        crate::ui::compute_view(&mut app.state, ratatui::layout::Rect::new(0, 0, 106, 60));
+        let divider = spaces_divider(&app);
+        feed_raw_mouse(
+            &mut app,
+            &[
+                (MouseEventKind::Down(MouseButton::Left), column, divider.y),
+                (MouseEventKind::Up(MouseButton::Left), column, divider.y),
+            ],
+        );
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), written);
+
+        // Invalid saved values fall back to the default split.
+        for invalid in ["nan", "\"tall\"", "inf"] {
+            std::fs::write(
+                &path,
+                format!("onboarding = false\n[ui]\nspaces_split = {invalid}\n"),
+            )
+            .unwrap();
+            let app = files_split_app(&crate::config::Config::load().config);
+            assert_eq!(app.state.sidebar_section_split, 0.5, "{invalid}");
+        }
+        std::env::remove_var(crate::config::CONFIG_PATH_ENV_VAR);
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    #[test]
+    fn first_resource_reading_does_not_move_either_divider() {
+        use crate::app::system_resources::{
+            MemoryReading, ResourcePressure, ResourceReading, SystemResources,
+        };
+        let mut app = files_split_app(&Config::default());
+        // The live app starts by reserving the footer before any reading.
+        app.state.system_resources = SystemResources {
+            awaiting_first_sample: true,
+            ..SystemResources::default()
+        };
+        crate::ui::compute_view(&mut app.state, ratatui::layout::Rect::new(0, 0, 106, 60));
+        let before = (sidebar_sections(&app), spaces_divider(&app));
+        app.state.system_resources = SystemResources {
+            disk_available: Some(ResourceReading {
+                bytes: 197_895_245_824,
+                pressure: ResourcePressure::Normal,
+            }),
+            swap_used: Some(ResourceReading {
+                bytes: 0,
+                pressure: ResourcePressure::Normal,
+            }),
+            cpu_percent: Some(12),
+            memory: Some(MemoryReading {
+                used_bytes: 1,
+                total_bytes: 2,
+            }),
+            cpu_memory_supported: true,
+            ..SystemResources::default()
+        };
+        crate::ui::compute_view(&mut app.state, ratatui::layout::Rect::new(0, 0, 106, 60));
+        assert_eq!((sidebar_sections(&app), spaces_divider(&app)), before);
+    }
+
+    #[test]
+    fn files_split_save_failure_does_not_panic() {
+        let _guard = config_env_lock().lock().unwrap();
+        let blocker = temp_config_path("files-split-blocker");
+        std::fs::create_dir_all(blocker.parent().unwrap()).unwrap();
+        std::fs::write(&blocker, "not a directory").unwrap();
+        // The config "directory" is a regular file, so the write must fail.
+        std::env::set_var(
+            crate::config::CONFIG_PATH_ENV_VAR,
+            blocker.join("config.toml"),
+        );
+        let mut app = files_split_app(&Config::default());
+        app.save_files_split(0.25);
+        assert_eq!(app.state.files_split_saved, None);
+        assert!(app.state.config_diagnostic.is_some());
+        std::env::remove_var(crate::config::CONFIG_PATH_ENV_VAR);
+        let _ = std::fs::remove_dir_all(blocker.parent().unwrap());
     }
 
     #[test]

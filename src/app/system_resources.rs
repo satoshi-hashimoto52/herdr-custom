@@ -6,8 +6,9 @@
 //! [`App::next_system_resource_deadline`] empty, so neither wakes the loop to
 //! compute a reading nobody will see.
 //!
-//! The readings keep separate cadences. CPU and memory move continuously and
-//! are sampled every few seconds; swap keeps its own quick beat; free disk
+//! The readings keep separate cadences. CPU, memory, and memory pressure move
+//! continuously and are sampled every few seconds; swap keeps its own quick
+//! beat; free disk
 //! space moves in jumps — a build finishing, the Trash emptying — and is
 //! re-read on a slower beat that announces itself with a short-lived marker.
 //! One platform call answers all of them, so the slower beats cost no extra
@@ -16,7 +17,7 @@
 use std::time::{Duration, Instant};
 
 use super::App;
-use crate::platform::{CpuTicks, SystemResourceSample};
+use crate::platform::{CpuTicks, MemoryPressureLevel, SystemResourceSample};
 
 /// Swap sampling cadence. Slow enough to stay invisible in a CPU profile,
 /// quick enough that memory pressure during a build is noticed.
@@ -110,9 +111,15 @@ pub struct SystemResources {
     /// samples and while the platform cannot answer.
     pub cpu_percent: Option<u8>,
     pub memory: Option<MemoryReading>,
+    /// System-wide VM pressure. Unknown is deliberately rendered as normal.
+    pub memory_pressure: MemoryPressureLevel,
     /// Whether this host reports CPU and memory at all. Platforms that never
     /// will leave the two rows out rather than printing a permanent `--`.
     pub cpu_memory_supported: bool,
+    /// Set by the live app until its first platform sample lands. The
+    /// footer reserves its full height meanwhile, so the first reading does
+    /// not move the section dividers (tests start with it off).
+    pub awaiting_first_sample: bool,
 }
 
 /// Sampling schedule and marker timing for the sidebar footer.
@@ -315,6 +322,7 @@ impl App {
             // One platform call answers every reading, so the slower disk beat
             // never costs a syscall of its own.
             let sample = sample();
+            self.state.system_resources.awaiting_first_sample = false;
             if cpu_memory_due {
                 self.system_resource_schedule.last_cpu_memory_sample = Some(now);
                 let previous = self.system_resource_schedule.previous_cpu_ticks;
@@ -323,6 +331,7 @@ impl App {
                     .system_resources
                     .set_cpu(previous, sample.cpu_ticks);
                 self.state.system_resources.set_memory(sample.memory);
+                self.state.system_resources.memory_pressure = sample.memory_pressure;
             }
             if swap_due {
                 self.system_resource_schedule.last_swap_sample = Some(now);
@@ -479,6 +488,14 @@ mod tests {
             swap_used_bytes: Some(0),
             cpu_ticks: cpu,
             memory,
+            memory_pressure: MemoryPressureLevel::Unknown,
+        }
+    }
+
+    fn full_sample_with_pressure(pressure: MemoryPressureLevel) -> SystemResourceSample {
+        SystemResourceSample {
+            memory_pressure: pressure,
+            ..full_sample(None, memory(1, 2))
         }
     }
 
@@ -498,6 +515,17 @@ mod tests {
         let mut app = test_app();
         app.state.view.sidebar_rect = ratatui::layout::Rect::new(0, 0, 26, 40);
         app
+    }
+
+    #[test]
+    fn first_sample_ends_the_footer_reservation() {
+        let mut app = visible_app();
+        app.state.system_resources.awaiting_first_sample = true;
+        // Reserved at full height before anything is known.
+        assert_eq!(crate::ui::sidebar_footer_rows(&app.state), 5);
+        app.refresh_system_resources(Instant::now(), || full_sample(ticks(1, 2), memory(1, 2)));
+        assert!(!app.state.system_resources.awaiting_first_sample);
+        assert_eq!(crate::ui::sidebar_footer_rows(&app.state), 5);
     }
 
     #[test]
@@ -629,6 +657,43 @@ mod tests {
         // A failed read shows nothing rather than pinning the last value.
         app.refresh_system_resources(start + secs(6), || full_sample(None, None));
         assert_eq!(app.state.system_resources.memory, None);
+    }
+
+    #[test]
+    fn memory_pressure_tracks_the_memory_beat_and_failure_falls_back_to_unknown() {
+        let mut app = visible_app();
+        let start = Instant::now();
+
+        app.refresh_system_resources(start, || {
+            full_sample_with_pressure(MemoryPressureLevel::Warning)
+        });
+        assert_eq!(
+            app.state.system_resources.memory_pressure,
+            MemoryPressureLevel::Warning
+        );
+
+        // Pressure adds no per-frame work: it follows the existing RAM beat.
+        app.refresh_system_resources(start + secs(2), || {
+            panic!("memory pressure sampled before the RAM interval")
+        });
+
+        app.refresh_system_resources(start + secs(3), || {
+            full_sample_with_pressure(MemoryPressureLevel::Critical)
+        });
+        assert_eq!(
+            app.state.system_resources.memory_pressure,
+            MemoryPressureLevel::Critical
+        );
+
+        // A failed or unrecognized platform read replaces a stale alert
+        // instead of pinning it indefinitely.
+        app.refresh_system_resources(start + secs(6), || {
+            full_sample_with_pressure(MemoryPressureLevel::Unknown)
+        });
+        assert_eq!(
+            app.state.system_resources.memory_pressure,
+            MemoryPressureLevel::Unknown
+        );
     }
 
     #[test]

@@ -6,6 +6,8 @@ use ratatui::{
 };
 
 mod dialogs;
+mod file_metadata;
+pub(crate) mod files;
 mod keybind_help;
 mod menus;
 mod mobile;
@@ -80,15 +82,20 @@ pub(crate) use self::{
         agent_panel_scroll_for_target, agent_panel_scroll_metrics, agent_panel_scrollbar_rect,
         agent_panel_toggle_rect, all_agent_panel_entries, collapsed_sidebar_sections,
         collapsed_sidebar_toggle_rect, compute_workspace_card_areas, expanded_sidebar_sections,
-        expanded_sidebar_toggle_rect, normalized_workspace_scroll, sidebar_footer_rows,
-        sidebar_section_divider_rect, workspace_drop_slots, workspace_group_chevron_rect,
-        workspace_list_entries, workspace_list_entries_expanded, workspace_list_rect,
-        workspace_list_scroll_metrics, workspace_list_scrollbar_rect, workspace_parent_group_state,
-        AgentPanelEntry, WorkspaceListEntry,
+        expanded_sidebar_toggle_rect, files_split_for_divider_row, normalized_workspace_scroll,
+        sanitize_files_split, sanitize_spaces_split, sidebar_files_layout, sidebar_footer_rows,
+        sidebar_section_divider_rect, spaces_split_for_divider_row, workspace_drop_slots,
+        workspace_group_chevron_rect, workspace_list_entries, workspace_list_entries_expanded,
+        workspace_list_rect, workspace_list_scroll_metrics, workspace_list_scrollbar_rect,
+        workspace_parent_group_state, AgentPanelEntry, WorkspaceListEntry,
     },
 };
 
 pub(crate) use self::{
+    files::{
+        collect_file_metadata_within, list_directory, metadata_key, FileEntry, FileInfo,
+        FileInfoState, FilesExpandCheck, FilesExpandRequest, FilesHitGeometry, FilesPaneState,
+    },
     keybind_help::keybind_help_lines,
     mobile::{
         mobile_switcher_areas, mobile_switcher_max_scroll, mobile_switcher_target_at,
@@ -307,6 +314,19 @@ fn compute_view_internal(
             )
         })
         .unwrap_or_default();
+    let footer_rows = crate::ui::sidebar_footer_rows(app);
+    let (_, files_rect, files_divider_rect) = crate::ui::sidebar_files_layout(
+        sidebar_area,
+        app.sidebar_section_split,
+        footer_rows,
+        app.files_split,
+    );
+    let files_geometry = crate::ui::files::files_hit_geometry(
+        app,
+        files_rect,
+        files_divider_rect,
+        sidebar::sidebar_footer_rect(sidebar_area, footer_rows),
+    );
 
     app.view = crate::app::ViewState {
         layout: ViewLayout::Desktop,
@@ -323,6 +343,8 @@ fn compute_view_internal(
         toast_hit_area,
         pane_infos,
         split_borders,
+        files_geometry,
+        files_divider_rect,
     };
     app.sync_copy_mode_search_geometry();
 }
@@ -386,6 +408,8 @@ fn compute_mobile_view(
         toast_hit_area,
         pane_infos,
         split_borders,
+        files_geometry: None,
+        files_divider_rect: Rect::default(),
     };
     app.sync_copy_mode_search_geometry();
 }

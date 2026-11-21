@@ -373,11 +373,21 @@ pub(crate) fn hostname() -> Option<String> {
         .filter(|name| !name.is_empty())
 }
 
+// time_t is i64 on the 64-bit targets Herdr ships but narrower on some
+// 32-bit targets, so these conversions are only no-ops on some platforms.
+#[allow(clippy::useless_conversion)]
 pub(crate) fn local_datetime() -> Option<time::PrimitiveDateTime> {
     let mut timestamp: libc::time_t = 0;
     if unsafe { libc::time(&mut timestamp) } == -1 {
         return None;
     }
+    local_datetime_at(i64::from(timestamp))
+}
+
+/// Converts Unix seconds to the OS local time zone.
+#[allow(clippy::useless_conversion, clippy::unnecessary_fallible_conversions)] // see local_datetime
+pub(crate) fn local_datetime_at(unix_seconds: i64) -> Option<time::PrimitiveDateTime> {
+    let timestamp = libc::time_t::try_from(unix_seconds).ok()?;
     let mut local: libc::tm = unsafe { std::mem::zeroed() };
     if unsafe { libc::localtime_s(&mut local, &timestamp) } != 0 {
         return None;

@@ -9,14 +9,15 @@ use std::{
 
 use super::{
     read_limited_reader, ClipboardCommand, ClipboardImage, CpuTicks, ForegroundJob,
-    ForegroundProcess, LimitedRead, MemoryUsage, Signal, SystemResourceSample,
+    ForegroundProcess, LimitedRead, MemoryPressureLevel, MemoryUsage, Signal, SystemResourceSample,
 };
 
 pub(crate) use super::unix_common::{
     configure_status_command, create_remote_private_dir, create_remote_ssh_config_dir,
-    create_remote_ssh_config_file, hostname, local_datetime, remote_bridge_endpoint_path,
-    remote_private_temp_base, remote_reattach_argument, remote_reattach_program,
-    remote_ssh_config_paths, status_commands_supported, StatusCommandGuard,
+    create_remote_ssh_config_file, hostname, local_datetime, local_datetime_at,
+    remote_bridge_endpoint_path, remote_private_temp_base, remote_reattach_argument,
+    remote_reattach_program, remote_ssh_config_paths, status_commands_supported,
+    StatusCommandGuard,
 };
 
 const WSL_MARKER_ENV_VARS: &[&str] = &["WSL_DISTRO_NAME", "WSL_INTEROP"];
@@ -760,6 +761,7 @@ pub fn system_resource_sample() -> SystemResourceSample {
             &std::fs::read_to_string("/proc/stat").unwrap_or_default(),
         ),
         memory: memory_usage_from_meminfo(&meminfo),
+        memory_pressure: MemoryPressureLevel::Unknown,
     }
 }
 

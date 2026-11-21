@@ -1647,6 +1647,120 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn files_panel_does_not_capture_terminal_keys_before_it_is_clicked() {
+        let mut app = app_for_mouse_test();
+        let mut ws = Workspace::test_new("test");
+        let pane_id = ws.tabs[0].root_pane;
+        let (runtime, mut input_rx) =
+            crate::terminal::TerminalRuntime::test_with_channel_capacity(80, 24, 16);
+        ws.tabs[0].runtimes.insert(pane_id, runtime);
+        app.state.workspaces = vec![ws];
+        app.state.active = Some(0);
+        app.state.selected = 0;
+        app.state.mode = Mode::Terminal;
+        app.state.files_by_pane.insert(
+            pane_id,
+            crate::ui::FilesPaneState::reset(Some(std::path::PathBuf::from("/tmp"))),
+        );
+
+        assert_eq!(app.state.files_focus, None);
+        for key in [
+            TerminalKey::new(KeyCode::Char('x'), KeyModifiers::empty()),
+            TerminalKey::new(KeyCode::Up, KeyModifiers::empty()),
+            TerminalKey::new(KeyCode::Down, KeyModifiers::empty()),
+            TerminalKey::new(KeyCode::Char('j'), KeyModifiers::empty()),
+            TerminalKey::new(KeyCode::Char('k'), KeyModifiers::empty()),
+            TerminalKey::new(KeyCode::Char('o'), KeyModifiers::empty()),
+            TerminalKey::new(KeyCode::Char('p'), KeyModifiers::empty()),
+            TerminalKey::new(KeyCode::Enter, KeyModifiers::empty()),
+        ] {
+            assert!(app.handle_key(key).await.is_some());
+        }
+
+        let mut forwarded = 0;
+        while input_rx.try_recv().is_ok() {
+            forwarded += 1;
+        }
+        assert_eq!(forwarded, 8);
+        assert_eq!(app.state.files_focus, None);
+    }
+
+    #[tokio::test]
+    async fn clicking_files_tree_enters_files_keyboard_focus() {
+        let (mut app, _info) = app_with_screen_bytes(b"");
+        let pane_id = app.state.workspaces[0].tabs[0].root_pane;
+        app.state.files_by_pane.insert(
+            pane_id,
+            crate::ui::FilesPaneState::reset(Some(std::path::PathBuf::from("/tmp"))),
+        );
+        let area = app.state.files_panel_rect();
+        assert!(area.height > 2, "Files panel must have a clickable body");
+
+        app.handle_mouse(mouse(
+            MouseEventKind::Down(MouseButton::Left),
+            area.x + 1,
+            area.y + 1,
+        ));
+
+        assert_eq!(app.state.files_focus, Some(pane_id));
+        assert_eq!(
+            app.state
+                .files_by_pane
+                .get(&pane_id)
+                .and_then(|state| state.focused_dir.as_deref()),
+            Some(std::path::Path::new("/tmp"))
+        );
+    }
+
+    #[tokio::test]
+    async fn files_keyboard_focus_handles_navigation_and_escape_only_after_click() {
+        let (mut app, _info) = app_with_screen_bytes(b"");
+        let pane_id = app.state.workspaces[0].tabs[0].root_pane;
+        let root = std::path::PathBuf::from("/tmp");
+        let child = root.join("child");
+        let mut files = crate::ui::FilesPaneState::reset(Some(root.clone()));
+        files.directories.insert(
+            root.clone(),
+            vec![crate::ui::FileEntry {
+                path: child.clone(),
+                name: "child".into(),
+                is_dir: true,
+            }],
+        );
+        app.state.files_by_pane.insert(pane_id, files);
+        app.state.files_focus = Some(pane_id);
+
+        assert!(app
+            .handle_key(TerminalKey::new(KeyCode::Down, KeyModifiers::empty()))
+            .await
+            .is_none());
+        assert_eq!(
+            app.state.files_by_pane[&pane_id].focused_dir.as_ref(),
+            Some(&child)
+        );
+        assert!(app
+            .handle_key(TerminalKey::new(KeyCode::Esc, KeyModifiers::empty()))
+            .await
+            .is_none());
+        assert_eq!(app.state.files_focus, None);
+    }
+
+    #[tokio::test]
+    async fn terminal_click_returns_focus_from_files_to_pty() {
+        let (mut app, info) = app_with_screen_bytes(b"");
+        let pane_id = app.state.workspaces[0].tabs[0].root_pane;
+        app.state.files_focus = Some(pane_id);
+
+        app.handle_mouse(mouse(
+            MouseEventKind::Down(MouseButton::Left),
+            info.inner_rect.x,
+            info.inner_rect.y,
+        ));
+
+        assert_eq!(app.state.files_focus, None);
+    }
+
+    #[tokio::test]
     async fn local_popup_input_waits_for_channel_capacity() {
         let mut app = app_for_mouse_test();
         let (runtime, mut rx) =

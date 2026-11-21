@@ -322,6 +322,7 @@ impl AppState {
         let Some(tab_idx) = ws.find_tab_index_for_pane(pane_id) else {
             return false;
         };
+        self.files_focus = None;
         let previous = self.current_pane_focus_target();
         let target = PaneFocusTarget {
             workspace_id: ws.id.clone(),
@@ -2846,15 +2847,28 @@ impl AppState {
                 seq,
                 session_ref,
                 session_start_source,
+                permission_mode,
+                session_end,
             } => self
                 .update_terminal_state(pane_id, |terminal| {
-                    terminal.set_agent_session_ref_for_session_start(
+                    let is_claude = source == "herdr:claude" && agent_label == "claude";
+                    let session_mutation = terminal.set_agent_session_ref_for_session_start(
                         source,
                         agent_label,
-                        session_ref,
+                        session_ref.clone(),
                         seq,
                         session_start_source,
-                    )
+                    );
+                    let permission_mutation = is_claude
+                        .then(|| {
+                            terminal.update_claude_permission_mode(
+                                session_ref.as_ref(),
+                                permission_mode.as_deref(),
+                                session_end,
+                            )
+                        })
+                        .flatten();
+                    session_mutation.or(permission_mutation)
                 })
                 .into_iter()
                 .collect(),
@@ -2949,6 +2963,8 @@ impl AppState {
                 let _ = cache_updates;
                 Vec::new()
             }
+            AppEvent::FilesDirectoryListed { .. } => Vec::new(),
+            AppEvent::FileMetadataReady { .. } => Vec::new(),
             AppEvent::WorktreeAddFinished(_) => Vec::new(),
             AppEvent::WorktreeRemoveFinished(_) => Vec::new(),
             AppEvent::TabBarCommandFinished { .. } => Vec::new(),

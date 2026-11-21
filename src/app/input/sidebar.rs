@@ -4,6 +4,65 @@ use crate::app::state::{AppState, ViewLayout};
 
 use super::ScrollbarClickTarget;
 
+use crate::app::state::SidebarSplitDivider;
+
+fn split_key(divider: SidebarSplitDivider) -> &'static str {
+    match divider {
+        SidebarSplitDivider::Spaces => "spaces_split",
+        SidebarSplitDivider::Files => "files_split",
+    }
+}
+
+fn trace_split(divider: SidebarSplitDivider, event: &str, before: f32, after: f32) {
+    if super::files_trace::enabled() {
+        let key = split_key(divider);
+        super::files_trace::state_change(
+            event,
+            if divider == SidebarSplitDivider::Files {
+                "files-split"
+            } else {
+                "spaces-split"
+            },
+            "-",
+            &format!("{key}={before:.4}"),
+            &format!("{key}={after:.4}"),
+        );
+    }
+}
+
+/// `HERDR_FILES_TRACE_PATH` only: one divider-drag mouse event with the raw
+/// kind, position, drag state and what was decided.
+#[allow(clippy::too_many_arguments)] // flat diagnostic record, trace-only
+fn trace_divider_mouse(
+    divider: SidebarSplitDivider,
+    mouse: crossterm::event::MouseEvent,
+    active: bool,
+    start_split: f32,
+    start_row: u16,
+    last_drag_row: u16,
+    started_at: std::time::Instant,
+    decision: &str,
+    split: f32,
+) {
+    if !super::files_trace::enabled() {
+        return;
+    }
+    let key = split_key(divider);
+    super::files_trace::state_change(
+        "divider-mouse",
+        decision,
+        "-",
+        &format!(
+            "kind={:?} column={} row={} drag_active={active} start_split={start_split:.4} start_row={start_row} last_drag_row={last_drag_row} t_ms={}",
+            mouse.kind,
+            mouse.column,
+            mouse.row,
+            started_at.elapsed().as_millis(),
+        ),
+        &format!("{key}={split:.4}"),
+    );
+}
+
 impl AppState {
     pub(super) fn workspace_list_rect(&self) -> Rect {
         let sidebar = self.view.sidebar_rect;
@@ -22,12 +81,432 @@ impl AppState {
         if self.sidebar_collapsed || sidebar.width <= 1 || sidebar.height == 0 {
             return Rect::default();
         }
-        let (_, detail_area) = crate::ui::expanded_sidebar_sections(
+        // sidebar_files_layout returns (agents, files, divider); agent rows
+        // must hit-test against the Agents section, not the Files tree.
+        let (agent_area, _, _) = crate::ui::sidebar_files_layout(
             sidebar,
             self.sidebar_section_split,
             crate::ui::sidebar_footer_rows(self),
+            self.files_split,
         );
-        detail_area
+        agent_area
+    }
+
+    pub(super) fn files_panel_rect(&self) -> Rect {
+        let sidebar = self.view.sidebar_rect;
+        if self.sidebar_collapsed || sidebar.width <= 1 || sidebar.height == 0 {
+            return Rect::default();
+        }
+        let (_, files_area, _) = crate::ui::sidebar_files_layout(
+            sidebar,
+            self.sidebar_section_split,
+            crate::ui::sidebar_footer_rows(self),
+            self.files_split,
+        );
+        files_area
+    }
+
+    /// Rows the Files tree viewport shows, from the rendered geometry when
+    /// available so input and render agree.
+    fn files_viewport_rows(&self) -> usize {
+        self.view
+            .files_geometry
+            .as_ref()
+            .map(|geometry| geometry.viewport.height as usize)
+            .unwrap_or_else(|| {
+                crate::ui::files::files_section_layout(self.files_panel_rect())
+                    .tree
+                    .height as usize
+            })
+    }
+
+    /// Whether a point is on the Files section or the Agents/Files divider.
+    pub(super) fn files_section_contains(&self, col: u16, row: u16) -> bool {
+        let point = (col, row).into();
+        self.view.files_divider_rect.contains(point)
+            || self
+                .view
+                .files_geometry
+                .as_ref()
+                .is_some_and(|geometry| geometry.area.contains(point))
+    }
+
+    /// The whole drawn divider row is the hitbox (no tolerance rows, so the
+    /// last agent row and the `files` header stay clickable).
+    pub(super) fn on_files_split_divider(&self, col: u16, row: u16) -> bool {
+        !self.sidebar_collapsed
+            && self.view.layout != crate::app::state::ViewLayout::Mobile
+            && self.view.files_divider_rect.contains((col, row).into())
+    }
+
+    fn set_files_split_from_row(&mut self, row: u16) -> bool {
+        let Some(split) = crate::ui::files_split_for_divider_row(
+            self.view.sidebar_rect,
+            self.sidebar_section_split,
+            crate::ui::sidebar_footer_rows(self),
+            row,
+        ) else {
+            return false;
+        };
+        if (split - self.files_split).abs() <= f32::EPSILON {
+            return false;
+        }
+        self.files_split = split;
+        true
+    }
+
+    fn set_spaces_split_from_row(&mut self, row: u16) -> bool {
+        if self.sidebar_collapsed {
+            return false;
+        }
+        let Some(split) = crate::ui::spaces_split_for_divider_row(
+            self.view.sidebar_rect,
+            crate::ui::sidebar_footer_rows(self),
+            row,
+        ) else {
+            return false;
+        };
+        if (split - self.sidebar_section_split).abs() <= f32::EPSILON {
+            return false;
+        }
+        self.sidebar_section_split = split;
+        self.mark_session_dirty();
+        true
+    }
+
+    pub(crate) fn sidebar_split_value(&self, divider: SidebarSplitDivider) -> f32 {
+        match divider {
+            SidebarSplitDivider::Spaces => self.sidebar_section_split,
+            SidebarSplitDivider::Files => self.files_split,
+        }
+    }
+
+    fn set_sidebar_split_from_row(&mut self, divider: SidebarSplitDivider, row: u16) -> bool {
+        match divider {
+            SidebarSplitDivider::Spaces => self.set_spaces_split_from_row(row),
+            SidebarSplitDivider::Files => self.set_files_split_from_row(row),
+        }
+    }
+
+    /// Spaces/Agents and Agents/Files divider drags. `Some(outcome)` means the
+    /// event belonged to a drag (started, moved or ended it) and must not be
+    /// handled further.
+    ///
+    /// Transitions (identical for both dividers):
+    /// - `Down(Left)` on a divider row starts the drag.
+    /// - `Drag(Left)` (button reported held) is the only event that moves it.
+    /// - `Up(_)` anywhere ends it at the last applied drag position.
+    /// - A button-less `Moved` while dragging means the host never delivered
+    ///   the release: end at the last drag position, ignoring its own row.
+    /// - Esc (`cancel_files_split_drag`) restores the start and saves nothing.
+    ///
+    /// The release is saved once, and only when the split changed.
+    pub(super) fn handle_files_split_drag(
+        &mut self,
+        mouse: crossterm::event::MouseEvent,
+    ) -> Option<Option<super::mouse::MouseAction>> {
+        use crate::app::state::{DragState, DragTarget};
+        use crossterm::event::{MouseButton, MouseEventKind};
+        if let Some(DragState {
+            target:
+                DragTarget::FilesSplitDivider {
+                    divider,
+                    start_split,
+                    start_row,
+                    last_drag_row,
+                    started_at,
+                },
+        }) = self.drag
+        {
+            let trace = |app: &Self, decision: &str, last_drag_row: u16| {
+                trace_divider_mouse(
+                    divider,
+                    mouse,
+                    true,
+                    start_split,
+                    start_row,
+                    last_drag_row,
+                    started_at,
+                    decision,
+                    app.sidebar_split_value(divider),
+                );
+            };
+            return Some(match mouse.kind {
+                MouseEventKind::Drag(MouseButton::Left) => {
+                    let before = self.sidebar_split_value(divider);
+                    let applied = self.set_sidebar_split_from_row(divider, mouse.row);
+                    if let Some(DragState {
+                        target: DragTarget::FilesSplitDivider { last_drag_row, .. },
+                    }) = self.drag.as_mut()
+                    {
+                        *last_drag_row = mouse.row;
+                    }
+                    trace(
+                        self,
+                        if applied {
+                            "drag-applied"
+                        } else {
+                            "drag-ignored-same-or-clamped"
+                        },
+                        mouse.row,
+                    );
+                    if applied {
+                        trace_split(
+                            divider,
+                            "divider-drag-move",
+                            before,
+                            self.sidebar_split_value(divider),
+                        );
+                        self.trace_files_split_layout("divider-drag-move");
+                    }
+                    None
+                }
+                MouseEventKind::Up(_) | MouseEventKind::Moved => {
+                    let reason = if matches!(mouse.kind, MouseEventKind::Moved) {
+                        "end-by-buttonless-motion(kept-last-drag-row)"
+                    } else {
+                        "end-by-release"
+                    };
+                    self.drag = None;
+                    let value = self.sidebar_split_value(divider);
+                    let changed = (value - start_split).abs() > f32::EPSILON;
+                    trace(
+                        self,
+                        if changed {
+                            reason
+                        } else {
+                            "end-unchanged-no-save"
+                        },
+                        last_drag_row,
+                    );
+                    trace_split(
+                        divider,
+                        if matches!(mouse.kind, MouseEventKind::Moved) {
+                            "divider-drag-end-by-motion"
+                        } else {
+                            "divider-drag-end"
+                        },
+                        start_split,
+                        value,
+                    );
+                    self.trace_files_split_layout("divider-drag-end");
+                    changed.then_some(match divider {
+                        SidebarSplitDivider::Spaces => {
+                            super::mouse::MouseAction::SaveSpacesSplit(value)
+                        }
+                        SidebarSplitDivider::Files => {
+                            super::mouse::MouseAction::SaveFilesSplit(value)
+                        }
+                    })
+                }
+                _ => {
+                    trace(self, "ignored-other-kind", last_drag_row);
+                    None
+                }
+            });
+        }
+        if !matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left))
+            || !matches!(
+                self.mode,
+                crate::app::Mode::Terminal | crate::app::Mode::Navigate
+            )
+        {
+            return None;
+        }
+        let divider = if self.on_files_split_divider(mouse.column, mouse.row) {
+            SidebarSplitDivider::Files
+        } else if self.view.layout != ViewLayout::Mobile
+            && self.on_sidebar_section_divider(mouse.column, mouse.row)
+        {
+            SidebarSplitDivider::Spaces
+        } else {
+            return None;
+        };
+        let started_at = std::time::Instant::now();
+        let start_split = self.sidebar_split_value(divider);
+        self.drag = Some(DragState {
+            target: DragTarget::FilesSplitDivider {
+                divider,
+                start_split,
+                start_row: mouse.row,
+                last_drag_row: mouse.row,
+                started_at,
+            },
+        });
+        trace_divider_mouse(
+            divider,
+            mouse,
+            false,
+            start_split,
+            mouse.row,
+            mouse.row,
+            started_at,
+            "start",
+            start_split,
+        );
+        trace_split(divider, "divider-drag-start", start_split, start_split);
+        self.trace_files_split_layout("divider-drag-start");
+        Some(None)
+    }
+
+    /// `HERDR_FILES_TRACE_PATH` only: the ratio and the rects it produces.
+    pub(crate) fn trace_files_split_layout(&self, event: &str) {
+        if !super::files_trace::enabled() {
+            return;
+        }
+        let footer_rows = crate::ui::sidebar_footer_rows(self);
+        let (agents, files, divider) = crate::ui::sidebar_files_layout(
+            self.view.sidebar_rect,
+            self.sidebar_section_split,
+            footer_rows,
+            self.files_split,
+        );
+        let spaces = crate::ui::workspace_list_rect(
+            self.view.sidebar_rect,
+            self.sidebar_section_split,
+            footer_rows,
+        );
+        super::files_trace::state_change(
+            "layout",
+            event,
+            "-",
+            &format!("sidebar={:?} footer_rows={footer_rows}", self.view.sidebar_rect),
+            &format!(
+                "spaces_split={:.4} files_split={:.4} spaces_rect={spaces:?} agents_rect={agents:?} divider={divider:?} files_rect={files:?}",
+                self.sidebar_section_split, self.files_split
+            ),
+        );
+    }
+
+    /// Esc during a divider drag restores the split it started from.
+    pub(super) fn cancel_files_split_drag(&mut self) -> bool {
+        let Some(crate::app::state::DragState {
+            target:
+                crate::app::state::DragTarget::FilesSplitDivider {
+                    divider,
+                    start_split,
+                    ..
+                },
+        }) = self.drag
+        else {
+            return false;
+        };
+        let before = self.sidebar_split_value(divider);
+        match divider {
+            SidebarSplitDivider::Spaces => {
+                self.sidebar_section_split = start_split;
+                self.mark_session_dirty();
+            }
+            SidebarSplitDivider::Files => self.files_split = start_split,
+        }
+        self.drag = None;
+        trace_split(divider, "divider-drag-cancel", before, start_split);
+        true
+    }
+
+    pub(crate) fn files_trace_snapshot(&self, pane_id: crate::layout::PaneId) -> Option<String> {
+        if !super::files_trace::enabled() {
+            return None;
+        }
+        Some(self.files_by_pane.get(&pane_id).map_or_else(
+            || "<none>".to_string(),
+            crate::ui::FilesPaneState::trace_summary,
+        ))
+    }
+
+    pub(crate) fn trace_files_change(
+        &self,
+        pane_id: crate::layout::PaneId,
+        event: &str,
+        reason: &str,
+        before: Option<String>,
+    ) {
+        let Some(before) = before else {
+            return;
+        };
+        let after = self.files_by_pane.get(&pane_id).map_or_else(
+            || "<none>".to_string(),
+            crate::ui::FilesPaneState::trace_summary,
+        );
+        if before != after {
+            super::files_trace::state_change(event, reason, self.files_focus, &before, &after);
+        }
+    }
+
+    /// Explicitly focuses a Files directory (row click, keyboard, buttons).
+    /// The only callers that may move `focused_dir` or start an expansion.
+    pub(super) fn focus_files_dir(
+        &mut self,
+        pane_id: crate::layout::PaneId,
+        path: std::path::PathBuf,
+        event: &str,
+    ) {
+        let viewport = self.files_viewport_rows();
+        let before = self.files_trace_snapshot(pane_id);
+        let Some(state) = self.files_by_pane.get_mut(&pane_id) else {
+            return;
+        };
+        let scheduled = state.focus_dir_explicit(pane_id, path.clone(), std::time::Instant::now());
+        state.ensure_visible(&path, viewport);
+        state.clamp_scroll(viewport);
+        self.trace_files_change(
+            pane_id,
+            event,
+            if scheduled {
+                "delayed-expand-scheduled"
+            } else {
+                "focus-unchanged"
+            },
+            before,
+        );
+    }
+
+    pub(super) fn move_files_focus(&mut self, delta: isize, event: &str) {
+        let Some(pane_id) = self.files_focus else {
+            return;
+        };
+        let Some(state) = self.files_by_pane.get(&pane_id) else {
+            return;
+        };
+        let dirs = state.focusable_directories();
+        if dirs.is_empty() {
+            return;
+        }
+        let position = dirs
+            .iter()
+            .position(|path| Some(path) == state.focused_dir.as_ref())
+            .unwrap_or(0);
+        let next = if delta.is_negative() {
+            position.saturating_sub(delta.unsigned_abs())
+        } else {
+            position
+                .saturating_add(delta as usize)
+                .min(dirs.len().saturating_sub(1))
+        };
+        self.focus_files_dir(pane_id, dirs[next].clone(), event);
+    }
+
+    /// Wheel over the Files viewport: changes only the scroll offset.
+    pub(super) fn scroll_files(&mut self, delta: i16) {
+        let Some(pane_id) = self.files_focus.or_else(|| {
+            self.active
+                .and_then(|idx| self.workspaces.get(idx)?.focused_pane_id())
+        }) else {
+            return;
+        };
+        let viewport = self.files_viewport_rows();
+        let before = self.files_trace_snapshot(pane_id);
+        let Some(state) = self.files_by_pane.get_mut(&pane_id) else {
+            return;
+        };
+        let max_scroll = state.visible_rows().len().saturating_sub(viewport);
+        let current = state.scroll.min(max_scroll);
+        state.scroll = if delta.is_negative() {
+            current.saturating_sub(delta.unsigned_abs() as usize)
+        } else {
+            current.saturating_add(delta as usize).min(max_scroll)
+        };
+        self.trace_files_change(pane_id, "mouse-scroll", "wheel-over-viewport", before);
     }
 
     pub(super) fn workspace_list_scrollbar_target_at(
@@ -295,18 +774,6 @@ impl AppState {
             && row < rect.y + rect.height
     }
 
-    pub(super) fn set_sidebar_section_split(&mut self, row: u16) {
-        let sidebar = self.view.sidebar_rect;
-        let content_height = sidebar.height;
-        if content_height < 6 {
-            return;
-        }
-        let relative_y = row.saturating_sub(sidebar.y);
-        let ratio = (relative_y as f32) / (content_height as f32);
-        self.sidebar_section_split = ratio.clamp(0.1, 0.9);
-        self.mark_session_dirty();
-    }
-
     pub(super) fn workspace_at_row(&self, row: u16) -> Option<usize> {
         let footer = self.sidebar_footer_rect();
         if footer == Rect::default() {
@@ -491,7 +958,7 @@ impl AppState {
             && row < rect.y + rect.height
     }
 
-    pub(super) fn agent_detail_target_at(
+    pub(crate) fn agent_detail_target_at(
         &self,
         row: u16,
     ) -> Option<(usize, usize, crate::layout::PaneId)> {
@@ -1905,6 +2372,9 @@ mod tests {
     #[test]
     fn dragging_sidebar_section_divider_sets_split_ratio() {
         let mut app = app_for_mouse_test();
+        // Tall enough that Spaces may grow while Agents and the whole Files
+        // section (details included) keep their minimum.
+        app.state.view.sidebar_rect = Rect::new(0, 0, 26, 60);
         let divider = crate::ui::sidebar_section_divider_rect(
             app.state.view.sidebar_rect,
             app.state.sidebar_section_split,

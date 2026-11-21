@@ -61,6 +61,10 @@ pub(super) enum MouseAction {
         menu: ContextMenuState,
         idx: usize,
     },
+    /// Persist the Agents/Files split after a divider drag was released.
+    SaveFilesSplit(f32),
+    /// Spaces/Agents divider released at a new split: persist it.
+    SaveSpacesSplit(f32),
 }
 
 enum MobileMouseResult {
@@ -104,9 +108,24 @@ impl AppState {
         source_id: crate::app::InputSourceId,
         mouse: MouseEvent,
     ) -> Option<MouseAction> {
+        super::files_trace::record("handle_mouse=entered");
         if self.mode == Mode::Onboarding {
             self.handle_onboarding_mouse(mouse);
             return None;
+        }
+
+        // An Agents/Files divider drag owns every mouse event until release,
+        // so nothing reaches the PTY, agent rows or the Files tree meanwhile.
+        if let Some(outcome) = self.handle_files_split_drag(mouse) {
+            return outcome;
+        }
+
+        // A pressed Files button is released by any Up, wherever it lands;
+        // it stays lit until its minimum visible time, cleared by the tick.
+        if matches!(mouse.kind, MouseEventKind::Up(_)) {
+            if let Some(press) = self.files_button_press.as_mut() {
+                press.held = false;
+            }
         }
 
         if self.mode == Mode::Terminal
@@ -190,6 +209,38 @@ impl AppState {
             && mouse.column < sidebar.x + sidebar.width
             && mouse.row >= sidebar.y
             && mouse.row < sidebar.y + sidebar.height;
+        let in_files_geometry = self
+            .view
+            .files_geometry
+            .as_ref()
+            .is_some_and(|geometry| geometry.area.contains((mouse.column, mouse.row).into()));
+        super::files_trace::record_with(|| {
+            format!(
+            "geometry sidebar_rect={sidebar:?} sidebar_contains={} files_area={:?} files_area_contains={} files_viewport={:?} files_viewport_contains={} files_contains={} geometry_pane_id={:?} geometry_generation={:?} geometry_rows={} active_pane_id={:?} files_focus_before={:?}",
+            sidebar.contains((mouse.column, mouse.row).into()),
+            self.view.files_geometry.as_ref().map(|geometry| geometry.area),
+            self.view.files_geometry.as_ref().is_some_and(|geometry| geometry.area.contains((mouse.column, mouse.row).into())),
+            self.view.files_geometry.as_ref().map(|geometry| geometry.viewport),
+            self.view.files_geometry.as_ref().is_some_and(|geometry| geometry.viewport.contains((mouse.column, mouse.row).into())),
+            in_files_geometry,
+            self.view.files_geometry.as_ref().map(|geometry| geometry.pane_id),
+            self.view.files_geometry.as_ref().map(|geometry| geometry.generation),
+            self.view.files_geometry.as_ref().map_or(0, |geometry| geometry.rows.len()),
+            self.active.and_then(|idx| self.workspaces.get(idx)).and_then(|workspace| workspace.focused_pane_id()),
+            self.files_focus,
+        )
+        });
+
+        // ターミナルをクリックしたら、FilesのキーボードフォーカスをPTYへ戻す。
+        if matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left)) && !in_sidebar {
+            let files_focus_before = self.files_focus;
+            self.files_focus = None;
+            super::files_trace::record_with(|| {
+                format!(
+                "files_focus_update condition=outside_sidebar before={files_focus_before:?} after=None"
+            )
+            });
+        }
 
         if self.handle_right_click_passthrough(terminal_runtimes, source_id, mouse, in_sidebar) {
             return None;
@@ -431,14 +482,6 @@ impl AppState {
                     return None;
                 }
 
-                if self.on_sidebar_section_divider(mouse.column, mouse.row) {
-                    self.drag = Some(DragState {
-                        target: DragTarget::SidebarSectionDivider,
-                    });
-                    self.set_sidebar_section_split(mouse.row);
-                    return None;
-                }
-
                 if !in_sidebar {
                     if let Some(border) = self.find_border_at(mouse.column, mouse.row) {
                         let grab_offset = match border.direction {
@@ -520,7 +563,7 @@ impl AppState {
                     return None;
                 }
 
-                if in_sidebar {
+                if in_sidebar || in_files_geometry {
                     if self.on_sidebar_toggle(mouse.column, mouse.row) {
                         self.sidebar_collapsed = !self.sidebar_collapsed;
                         return None;
@@ -548,6 +591,163 @@ impl AppState {
                         && mouse.column < new_button.x + new_button.width;
                     if on_new_button {
                         return Some(MouseAction::NewWorkspace);
+                    }
+
+                    let files_area = self
+                        .view
+                        .files_geometry
+                        .as_ref()
+                        .map(|geometry| geometry.area)
+                        .unwrap_or_else(|| self.files_panel_rect());
+                    super::files_trace::record_with(|| {
+                        format!(
+                            "Files saved_or_fallback_area={files_area:?} contains={}",
+                            files_area.contains((mouse.column, mouse.row).into())
+                        )
+                    });
+                    if files_area != Rect::default()
+                        && mouse.row >= files_area.y
+                        && mouse.row < files_area.y + files_area.height
+                    {
+                        // The blank row above the buttons is inert: no focus,
+                        // selection, expansion or button change, no scroll.
+                        let on_gap = self.view.files_geometry.as_ref().is_some_and(|geometry| {
+                            geometry.gap.contains((mouse.column, mouse.row).into())
+                        });
+                        if on_gap {
+                            super::files_trace::record("Files hit=gap result=ignored");
+                            return None;
+                        }
+                        if matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left)) {
+                            let pane_id = self
+                                .active
+                                .and_then(|idx| self.workspaces.get(idx)?.focused_pane_id())?;
+                            let files_focus_before = self.files_focus;
+                            self.files_focus = Some(pane_id);
+                            super::files_trace::record_with(|| {
+                                format!(
+                                "Files area_contains=true files_area={files_area:?} files_focus_update before={files_focus_before:?} after={:?}",
+                                self.files_focus,
+                            )
+                            });
+                            let geometry = self.view.files_geometry.clone()?;
+                            if let Some(button) = geometry
+                                .buttons
+                                .iter()
+                                .position(|rect| rect.contains((mouse.column, mouse.row).into()))
+                            {
+                                super::files_trace::record_with(|| {
+                                    format!(
+                                    "Files hit=button index={button} rect_contains=true rect={:?}",
+                                    geometry.buttons[button]
+                                )
+                                });
+                                // Only a usable button lights up.
+                                let enabled =
+                                    self.files_by_pane.get(&pane_id).is_some_and(|state| {
+                                        crate::ui::files::files_buttons_enabled(state)[button]
+                                    });
+                                self.files_button_press = enabled.then(|| {
+                                    crate::ui::files::FilesButtonPress::new(
+                                        pane_id,
+                                        button,
+                                        true,
+                                        std::time::Instant::now(),
+                                    )
+                                });
+                                match button {
+                                    0 => self.move_files_focus(-1, "button-move"),
+                                    1 => self.move_files_focus(1, "button-move"),
+                                    2 => {
+                                        if let Some(path) = self
+                                            .files_by_pane
+                                            .get(&pane_id)
+                                            .and_then(|state| state.focused_dir.clone())
+                                        {
+                                            #[cfg(target_os = "macos")]
+                                            let _ = std::process::Command::new("open")
+                                                .arg(path)
+                                                .spawn();
+                                            #[cfg(target_os = "linux")]
+                                            let _ = std::process::Command::new("xdg-open")
+                                                .arg(path)
+                                                .spawn();
+                                            #[cfg(target_os = "windows")]
+                                            let _ = std::process::Command::new("explorer")
+                                                .arg(path)
+                                                .spawn();
+                                        }
+                                    }
+                                    3 => {
+                                        if let Some(path) = self
+                                            .files_by_pane
+                                            .get(&pane_id)
+                                            .and_then(|state| state.focused_dir.clone())
+                                        {
+                                            self.request_clipboard_write = Some(
+                                                path.to_string_lossy().into_owned().into_bytes(),
+                                            );
+                                            self.clipboard_feedback_override =
+                                                Some("path copied".into());
+                                        }
+                                    }
+                                    _ => {}
+                                }
+                            } else if let Some(hit) = geometry
+                                .rows
+                                .iter()
+                                .find(|hit| hit.row.y == mouse.row)
+                                // Directory rows are clickable across the drawn row;
+                                // files only on their name token.
+                                .filter(|hit| {
+                                    let target = if hit.is_dir { hit.row } else { hit.name };
+                                    target.contains((mouse.column, mouse.row).into())
+                                })
+                            {
+                                super::files_trace::record_with(|| {
+                                    format!(
+                                    "Files hit=row path_basename={} row_contains={} name_contains={} row_rect={:?} name_rect={:?}",
+                                    super::files_trace::basename(&hit.path),
+                                    hit.row.contains((mouse.column, mouse.row).into()),
+                                    hit.name.contains((mouse.column, mouse.row).into()),
+                                    hit.row,
+                                    hit.name,
+                                )
+                                });
+                                if hit.is_dir {
+                                    self.focus_files_dir(
+                                        pane_id,
+                                        hit.path.clone(),
+                                        "directory-click",
+                                    );
+                                } else {
+                                    let before = self.files_trace_snapshot(pane_id);
+                                    if let Some(state) = self.files_by_pane.get_mut(&pane_id) {
+                                        state.selected_file = Some(hit.path.clone());
+                                        state.info = crate::ui::FileInfoState::Hidden;
+                                    }
+                                    self.trace_files_change(
+                                        pane_id,
+                                        "file-click",
+                                        "file-name-token",
+                                        before,
+                                    );
+                                }
+                            } else {
+                                super::files_trace::record(
+                                    "Files hit=none condition=no_button_or_row",
+                                );
+                            }
+                        }
+                        super::files_trace::record(
+                            "handle_mouse=returned condition=Files_area result=consumed",
+                        );
+                        return None;
+                    }
+
+                    // Files以外のサイドバー操作では、Filesのキーボードフォーカスを解除する。
+                    if matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left)) {
+                        self.files_focus = None;
                     }
 
                     if let Some(target) =
@@ -819,9 +1019,8 @@ impl AppState {
                         DragTarget::SidebarDivider => {
                             self.set_manual_sidebar_width(mouse.column);
                         }
-                        DragTarget::SidebarSectionDivider => {
-                            self.set_sidebar_section_split(mouse.row);
-                        }
+                        // Handled up front by handle_files_split_drag.
+                        DragTarget::FilesSplitDivider { .. } => {}
                         DragTarget::ReleaseNotesScrollbar { .. }
                         | DragTarget::ProductAnnouncementScrollbar { .. }
                         | DragTarget::KeybindHelpScrollbar { .. } => {}
@@ -984,6 +1183,17 @@ impl AppState {
             }
 
             MouseEventKind::ScrollUp if in_sidebar => {
+                if self.view.files_geometry.as_ref().is_some_and(|geometry| {
+                    geometry.viewport.contains((mouse.column, mouse.row).into())
+                }) {
+                    self.scroll_files(-1);
+                    return None;
+                }
+                if self.files_section_contains(mouse.column, mouse.row) {
+                    // Header, buttons, details and the divider never scroll
+                    // the tree or anything behind them.
+                    return None;
+                }
                 let agent_area = self.agent_panel_rect();
                 let over_agent_panel = agent_area != Rect::default()
                     && mouse.row >= agent_area.y
@@ -1003,6 +1213,17 @@ impl AppState {
                 }
             }
             MouseEventKind::ScrollDown if in_sidebar => {
+                if self.view.files_geometry.as_ref().is_some_and(|geometry| {
+                    geometry.viewport.contains((mouse.column, mouse.row).into())
+                }) {
+                    self.scroll_files(1);
+                    return None;
+                }
+                if self.files_section_contains(mouse.column, mouse.row) {
+                    // Header, buttons, details and the divider never scroll
+                    // the tree or anything behind them.
+                    return None;
+                }
                 let agent_area = self.agent_panel_rect();
                 let over_agent_panel = agent_area != Rect::default()
                     && mouse.row >= agent_area.y
