@@ -4819,6 +4819,19 @@ impl HeadlessServer {
         if self.has_app_client() {
             changed |= self.app.handle_system_resource_refresh(now);
             changed |= self.app.handle_work_timer_tick(now);
+            // Files is sidebar UI: it only runs while a full app client is
+            // attached, on the same post-render tick as the monolithic App.
+            if !geometry_dirty && self.app.handle_files_tasks(now) {
+                changed = true;
+                if crate::app::files_trace_enabled() {
+                    crate::app::files_trace_state_change(
+                        "files-task-tick",
+                        "session-server",
+                        &format!("foreground_client={:?}", self.foreground_client_id),
+                        &format!("app_clients={}", self.app_client_count()),
+                    );
+                }
+            }
         }
 
         if geometry_dirty {
@@ -5352,9 +5365,15 @@ mod tests {
     }
 
     fn test_headless_server_with_event_hub(event_hub: api::EventHub) -> HeadlessServer {
-        let config = crate::config::Config::default();
+        test_headless_server_with_config(&crate::config::Config::default(), event_hub)
+    }
+
+    fn test_headless_server_with_config(
+        config: &crate::config::Config,
+        event_hub: api::EventHub,
+    ) -> HeadlessServer {
         let (_api_tx, api_rx) = tokio::sync::mpsc::unbounded_channel();
-        let mut app = crate::app::App::new(&config, true, None, api_rx, event_hub);
+        let mut app = crate::app::App::new(config, true, None, api_rx, event_hub);
         app.state.local_sound_playback = false;
         app.local_terminal_notifications = false;
         app.local_input_source_switch = false;
@@ -8744,6 +8763,333 @@ next_tab = ""
         server.app.state.selected = 0;
         server.app.state.mode = crate::app::Mode::Terminal;
         input_rx
+    }
+
+    /// Server with one plain pane whose cwd is a real directory.
+    fn files_test_server(
+        name: &str,
+    ) -> (HeadlessServer, crate::layout::PaneId, std::path::PathBuf) {
+        let mut server = test_headless_server();
+        let root =
+            std::env::temp_dir().join(format!("herdr-server-files-{name}-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        for dir in ["alpha", "beta", "gamma"] {
+            fs::create_dir_all(root.join(dir)).expect("fixture dir");
+        }
+        let workspace = crate::workspace::Workspace::test_new("files");
+        let pane_id = workspace.tabs[0].root_pane;
+        server.app.state.workspaces = vec![workspace];
+        server.app.state.active = Some(0);
+        server.app.state.mode = crate::app::Mode::Terminal;
+        server.app.state.ensure_test_terminals();
+        let terminal_id = server.app.state.workspaces[0]
+            .terminal_id(pane_id)
+            .cloned()
+            .expect("terminal");
+        server
+            .app
+            .state
+            .terminals
+            .get_mut(&terminal_id)
+            .expect("terminal")
+            .cwd = root.clone();
+        (server, pane_id, root)
+    }
+
+    /// Attaches a full app client (with a writer, as a real connection has).
+    /// The returned receivers keep the client's channels open.
+    fn attach_files_client(
+        server: &mut HeadlessServer,
+        client_id: u64,
+    ) -> (
+        std::sync::mpsc::Receiver<Vec<u8>>,
+        std::sync::mpsc::Receiver<Vec<u8>>,
+    ) {
+        let (writer, control_rx, render_rx) = test_client_writer();
+        let mut client = test_app_client(Some(true), client_id);
+        client.writer = Some(writer);
+        server.clients.insert(client_id, client);
+        server.foreground_client_id = Some(client_id);
+        (control_rx, render_rx)
+    }
+
+    async fn settle_server_files(server: &mut HeadlessServer, pane_id: crate::layout::PaneId) {
+        server.handle_scheduled_tasks_headless(Instant::now(), false);
+        for _ in 0..400 {
+            let in_flight = server
+                .app
+                .state
+                .files_by_pane
+                .get(&pane_id)
+                .and_then(|state| state.pending_expand.as_ref())
+                .is_some_and(|request| request.in_flight);
+            if !in_flight {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+            server.drain_internal_events_with_forwarding();
+        }
+    }
+
+    /// Session mode: the server's App saves the divider ratio on release and
+    /// a newly started server (same construction path as `herdr server`)
+    /// restores it from the same temporary config file.
+    #[tokio::test]
+    async fn session_server_saves_and_restores_the_files_split() {
+        let _guard = crate::config::test_config_env_lock().lock().unwrap();
+        let dir = std::env::temp_dir().join(format!(
+            "herdr-server-split-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        fs::create_dir_all(&dir).expect("config dir");
+        let path = dir.join("config.toml");
+        fs::write(&path, "# session\n[ui]\n").expect("config");
+        std::env::set_var(crate::config::CONFIG_PATH_ENV_VAR, &path);
+
+        let layout_server = |config: &crate::config::Config| {
+            let mut server = test_headless_server_with_config(config, api::EventHub::default());
+            server.app.state.workspaces = vec![crate::workspace::Workspace::test_new("s")];
+            server.app.state.active = Some(0);
+            server.app.state.mode = crate::app::Mode::Terminal;
+            crate::ui::compute_view(
+                &mut server.app.state,
+                ratatui::layout::Rect::new(0, 0, 106, 60),
+            );
+            server
+        };
+        let mut server = layout_server(&crate::config::Config::load().config);
+        let _client = attach_files_client(&mut server, 1);
+        let divider = server.app.state.view.files_divider_rect;
+        let mouse = |kind, row| {
+            crate::raw_input::RawInputEvent::Mouse(crossterm::event::MouseEvent {
+                kind,
+                column: divider.x + divider.width / 2,
+                row,
+                modifiers: crossterm::event::KeyModifiers::empty(),
+            })
+        };
+        let left = crossterm::event::MouseButton::Left;
+        server.app.route_client_events(
+            vec![
+                mouse(crossterm::event::MouseEventKind::Down(left), divider.y),
+                mouse(crossterm::event::MouseEventKind::Drag(left), divider.y - 2),
+                mouse(crossterm::event::MouseEventKind::Drag(left), divider.y - 4),
+            ],
+            false,
+        );
+        assert_eq!(fs::read_to_string(&path).unwrap(), "# session\n[ui]\n");
+        server.app.route_client_events(
+            vec![mouse(
+                crossterm::event::MouseEventKind::Up(left),
+                divider.y - 4,
+            )],
+            false,
+        );
+        let dropped = server.app.state.files_split;
+        let saved = fs::read_to_string(&path).unwrap();
+        assert!(
+            saved.contains(&format!("files_split = {dropped:.3}")),
+            "{saved}"
+        );
+        assert!(saved.starts_with("# session\n"));
+
+        // The Spaces/Agents divider is saved the same way, next to it.
+        let spaces_divider = crate::ui::sidebar_section_divider_rect(
+            server.app.state.view.sidebar_rect,
+            server.app.state.sidebar_section_split,
+            crate::ui::sidebar_footer_rows(&server.app.state),
+        );
+        let spaces_mouse = |kind, row| {
+            crate::raw_input::RawInputEvent::Mouse(crossterm::event::MouseEvent {
+                kind,
+                column: spaces_divider.x + spaces_divider.width / 2,
+                row,
+                modifiers: crossterm::event::KeyModifiers::empty(),
+            })
+        };
+        server.app.route_client_events(
+            vec![
+                spaces_mouse(
+                    crossterm::event::MouseEventKind::Down(left),
+                    spaces_divider.y,
+                ),
+                spaces_mouse(
+                    crossterm::event::MouseEventKind::Drag(left),
+                    spaces_divider.y - 3,
+                ),
+            ],
+            false,
+        );
+        assert!(!fs::read_to_string(&path).unwrap().contains("spaces_split"));
+        server.app.route_client_events(
+            vec![spaces_mouse(
+                crossterm::event::MouseEventKind::Up(left),
+                spaces_divider.y - 3,
+            )],
+            false,
+        );
+        let spaces = server.app.state.sidebar_section_split;
+        let saved = fs::read_to_string(&path).unwrap();
+        assert!(
+            saved.contains(&format!("spaces_split = {spaces:.4}")),
+            "{saved}"
+        );
+        assert!(
+            saved.contains(&format!("files_split = {dropped:.3}")),
+            "{saved}"
+        );
+        crate::ui::compute_view(
+            &mut server.app.state,
+            ratatui::layout::Rect::new(0, 0, 106, 60),
+        );
+        let sections = |state: &crate::app::state::AppState| {
+            let footer = crate::ui::sidebar_footer_rows(state);
+            let (agents, files, divider) = crate::ui::sidebar_files_layout(
+                state.view.sidebar_rect,
+                state.sidebar_section_split,
+                footer,
+                state.files_split,
+            );
+            (
+                crate::ui::workspace_list_rect(
+                    state.view.sidebar_rect,
+                    state.sidebar_section_split,
+                    footer,
+                ),
+                agents,
+                divider,
+                files,
+            )
+        };
+        let before_restart = sections(&server.app.state);
+        assert_eq!(before_restart.0.height, spaces_divider.y - 3);
+
+        let restarted = layout_server(&crate::config::Config::load().config);
+        assert!((restarted.app.state.files_split - dropped).abs() < 0.001);
+        assert!((restarted.app.state.sidebar_section_split - spaces).abs() < 0.0001);
+        assert_eq!(sections(&restarted.app.state), before_restart);
+
+        std::env::remove_var(crate::config::CONFIG_PATH_ENV_VAR);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn session_server_runs_files_tasks_only_while_an_app_client_is_attached() {
+        let (mut server, pane_id, root) = files_test_server("client-gate");
+        // A headless server alone never starts Files work.
+        assert!(!server.has_app_client());
+        server.handle_scheduled_tasks_headless(Instant::now(), false);
+        assert!(server.app.state.files_by_pane.is_empty());
+
+        let _client = attach_files_client(&mut server, 1);
+        server.sync_foreground_client_state();
+        assert!(server.has_app_client());
+        settle_server_files(&mut server, pane_id).await;
+        let state = server
+            .app
+            .state
+            .files_by_pane
+            .get(&pane_id)
+            .expect("files state");
+        assert_eq!(state.root.as_ref(), Some(&root));
+        assert!(
+            state.directories.contains_key(&root),
+            "root listing applied"
+        );
+        let rows = state.visible_rows();
+        assert!(rows.iter().any(|row| row.path == root.join("beta")));
+
+        // Geometry is dirty right after a render: the task waits a tick.
+        server.app.state.files_by_pane.clear();
+        server.handle_scheduled_tasks_headless(Instant::now(), true);
+        assert!(server.app.state.files_by_pane.is_empty());
+
+        // The client leaves: the server keeps running and does no Files work.
+        server.remove_client(1);
+        assert!(!server.has_app_client());
+        server.handle_scheduled_tasks_headless(Instant::now(), false);
+        assert!(server.app.state.files_by_pane.is_empty());
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[tokio::test]
+    async fn session_server_follows_cwd_changes_for_the_selected_pane() {
+        let (mut server, pane_id, root) = files_test_server("cwd");
+        let _client = attach_files_client(&mut server, 1);
+        settle_server_files(&mut server, pane_id).await;
+        let beta = root.join("beta");
+        let terminal_id = server.app.state.workspaces[0]
+            .terminal_id(pane_id)
+            .cloned()
+            .expect("terminal");
+        server
+            .app
+            .state
+            .terminals
+            .get_mut(&terminal_id)
+            .expect("terminal")
+            .cwd = beta.clone();
+        settle_server_files(&mut server, pane_id).await;
+        let state = server.app.state.files_by_pane.get(&pane_id).expect("files");
+        assert_eq!(state.root.as_ref(), Some(&beta));
+        assert_eq!(state.focused_dir.as_ref(), Some(&beta));
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[tokio::test]
+    async fn session_client_keys_reach_files_only_while_files_has_focus() {
+        let (mut server, pane_id, root) = files_test_server("keys");
+        let _client = attach_files_client(&mut server, 1);
+        settle_server_files(&mut server, pane_id).await;
+        let (runtime, mut input_rx) =
+            crate::terminal::TerminalRuntime::test_with_channel_capacity(80, 24, 16);
+        let terminal_id = server.app.state.workspaces[0]
+            .terminal_id(pane_id)
+            .cloned()
+            .expect("terminal");
+        server.app.terminal_runtimes.insert(terminal_id, runtime);
+        let key = |code| {
+            crate::raw_input::RawInputEvent::Key(crate::input::TerminalKey::new(
+                code,
+                crossterm::event::KeyModifiers::empty(),
+            ))
+        };
+
+        // PTY focus: j goes to the shell, Files does not move.
+        server
+            .app
+            .route_client_events(vec![key(crossterm::event::KeyCode::Char('j'))], false);
+        assert!(input_rx.try_recv().is_ok(), "j reached the PTY");
+        assert_eq!(
+            server.app.state.files_by_pane[&pane_id]
+                .focused_dir
+                .as_ref(),
+            Some(&root)
+        );
+
+        // Files focus: j moves the directory cursor and nothing reaches the PTY.
+        server.app.state.files_focus = Some(pane_id);
+        server
+            .app
+            .route_client_events(vec![key(crossterm::event::KeyCode::Char('j'))], false);
+        assert!(input_rx.try_recv().is_err(), "j was consumed by Files");
+        assert_eq!(
+            server.app.state.files_by_pane[&pane_id]
+                .focused_dir
+                .as_ref(),
+            Some(&root.join("alpha"))
+        );
+        // Esc returns keyboard focus to the PTY.
+        server
+            .app
+            .route_client_events(vec![key(crossterm::event::KeyCode::Esc)], false);
+        assert_eq!(server.app.state.files_focus, None);
+        assert!(input_rx.try_recv().is_err());
+        let _ = fs::remove_dir_all(&root);
     }
 
     fn test_app_client(outer_terminal_focus: Option<bool>, last_activity: u64) -> ClientConnection {

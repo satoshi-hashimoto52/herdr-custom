@@ -9,14 +9,15 @@ use std::{
 
 use super::{
     read_limited_reader, ClipboardCommand, ClipboardImage, CpuTicks, ForegroundJob,
-    ForegroundProcess, LimitedRead, MemoryUsage, Signal, SystemResourceSample,
+    ForegroundProcess, LimitedRead, MemoryPressureLevel, MemoryUsage, Signal, SystemResourceSample,
 };
 
 pub(crate) use super::unix_common::{
     configure_status_command, create_remote_private_dir, create_remote_ssh_config_dir,
-    create_remote_ssh_config_file, hostname, local_datetime, remote_bridge_endpoint_path,
-    remote_private_temp_base, remote_reattach_argument, remote_reattach_program,
-    remote_ssh_config_paths, status_commands_supported, StatusCommandGuard,
+    create_remote_ssh_config_file, hostname, local_datetime, local_datetime_at,
+    remote_bridge_endpoint_path, remote_private_temp_base, remote_reattach_argument,
+    remote_reattach_program, remote_ssh_config_paths, status_commands_supported,
+    StatusCommandGuard,
 };
 
 const WSL_MARKER_ENV_VARS: &[&str] = &["WSL_DISTRO_NAME", "WSL_INTEROP"];
@@ -760,6 +761,7 @@ pub fn system_resource_sample() -> SystemResourceSample {
             &std::fs::read_to_string("/proc/stat").unwrap_or_default(),
         ),
         memory: memory_usage_from_meminfo(&meminfo),
+        memory_pressure: MemoryPressureLevel::Unknown,
     }
 }
 
@@ -817,6 +819,8 @@ fn memory_usage_from_meminfo(meminfo: &str) -> Option<MemoryUsage> {
 
 /// Space available to an unprivileged process, matching `df`.
 fn available_disk_bytes(path: &std::path::Path) -> Option<u64> {
+    use std::os::unix::ffi::OsStrExt;
+
     let path = std::ffi::CString::new(path.as_os_str().as_bytes()).ok()?;
     let mut stat = std::mem::MaybeUninit::<libc::statvfs>::uninit();
     // SAFETY: `path` is a valid NUL-terminated C string and `stat` is a
@@ -826,7 +830,7 @@ fn available_disk_bytes(path: &std::path::Path) -> Option<u64> {
     }
     // SAFETY: `statvfs` returned success, so the buffer is initialized.
     let stat = unsafe { stat.assume_init() };
-    u64::from(stat.f_frsize).checked_mul(stat.f_bavail)
+    stat.f_frsize.checked_mul(stat.f_bavail)
 }
 
 /// Swap in use, derived from `SwapTotal` minus `SwapFree`.

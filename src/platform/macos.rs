@@ -9,14 +9,15 @@ use std::sync::OnceLock;
 
 use super::{
     read_limited_reader, ClipboardCommand, ClipboardImage, CpuTicks, ForegroundJob,
-    ForegroundProcess, LimitedRead, MemoryUsage, Signal, SystemResourceSample,
+    ForegroundProcess, LimitedRead, MemoryPressureLevel, MemoryUsage, Signal, SystemResourceSample,
 };
 
 pub(crate) use super::unix_common::{
     configure_status_command, create_remote_private_dir, create_remote_ssh_config_dir,
-    create_remote_ssh_config_file, hostname, local_datetime, remote_bridge_endpoint_path,
-    remote_private_temp_base, remote_reattach_argument, remote_reattach_program,
-    remote_ssh_config_paths, status_commands_supported, StatusCommandGuard,
+    create_remote_ssh_config_file, hostname, local_datetime, local_datetime_at,
+    remote_bridge_endpoint_path, remote_private_temp_base, remote_reattach_argument,
+    remote_reattach_program, remote_ssh_config_paths, status_commands_supported,
+    StatusCommandGuard,
 };
 
 const PROC_PGRP_ONLY: u32 = 2;
@@ -1001,7 +1002,8 @@ pub fn process_exists(pid: u32) -> bool {
 /// "available" figure, which overstates the headroom a build or install has.
 const DATA_VOLUME_PATH: &str = "/System/Volumes/Data";
 
-/// Reads host disk and swap pressure through `statfs` and `sysctlbyname`.
+/// Reads host CPU, memory, disk, swap, and memory pressure through Mach,
+/// `statfs`, and `sysctlbyname` APIs.
 ///
 /// Both are direct syscalls against already-resident kernel counters, so this
 /// costs microseconds and never spawns a process.
@@ -1012,6 +1014,59 @@ pub fn system_resource_sample() -> SystemResourceSample {
         swap_used_bytes: swap_used_bytes(),
         cpu_ticks: cpu_ticks(),
         memory: memory_usage(),
+        memory_pressure: memory_pressure_level(),
+    }
+}
+
+/// Current system-wide memory pressure from the same kernel state used by
+/// macOS memory-pressure notifications.
+///
+/// The values are the public `DISPATCH_MEMORYPRESSURE_*` flags. Reading the
+/// sysctl is a direct, bounded kernel query: it starts no process and performs
+/// no filesystem I/O. A failed query or a future value we do not understand is
+/// intentionally `Unknown`, so the sidebar keeps its normal appearance.
+fn memory_pressure_level() -> MemoryPressureLevel {
+    let Ok(name) = std::ffi::CString::new("kern.memorystatus_vm_pressure_level") else {
+        return MemoryPressureLevel::Unknown;
+    };
+    let mut raw: libc::c_int = 0;
+    let mut len = std::mem::size_of::<libc::c_int>();
+    // SAFETY: `name` is NUL-terminated and `raw` is a writable `c_int`
+    // matching the supplied length. The sysctl is read-only because the new
+    // value pointer and length are null/zero.
+    let result = unsafe {
+        libc::sysctlbyname(
+            name.as_ptr(),
+            std::ptr::from_mut(&mut raw).cast::<libc::c_void>(),
+            &mut len,
+            std::ptr::null_mut(),
+            0,
+        )
+    };
+    memory_pressure_level_from_sysctl(result, len, raw)
+}
+
+fn memory_pressure_level_from_sysctl(
+    result: libc::c_int,
+    len: usize,
+    raw: libc::c_int,
+) -> MemoryPressureLevel {
+    if result != 0 || len != std::mem::size_of::<libc::c_int>() {
+        return MemoryPressureLevel::Unknown;
+    }
+    memory_pressure_level_from_raw(raw)
+}
+
+fn memory_pressure_level_from_raw(raw: libc::c_int) -> MemoryPressureLevel {
+    const NORMAL: libc::c_int = 0x01;
+    const WARNING: libc::c_int = 0x02;
+    const CRITICAL: libc::c_int = 0x04;
+
+    match raw {
+        NORMAL => MemoryPressureLevel::Normal,
+        WARNING => MemoryPressureLevel::Warning,
+        CRITICAL => MemoryPressureLevel::Critical,
+        _ => MemoryPressureLevel::Unknown,
     }
 }
 
@@ -1166,6 +1221,43 @@ fn swap_used_bytes() -> Option<u64> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn memory_pressure_dispatch_values_map_without_guessing() {
+        assert_eq!(
+            memory_pressure_level_from_raw(0x01),
+            MemoryPressureLevel::Normal
+        );
+        assert_eq!(
+            memory_pressure_level_from_raw(0x02),
+            MemoryPressureLevel::Warning
+        );
+        assert_eq!(
+            memory_pressure_level_from_raw(0x04),
+            MemoryPressureLevel::Critical
+        );
+        assert_eq!(
+            memory_pressure_level_from_raw(0),
+            MemoryPressureLevel::Unknown
+        );
+        assert_eq!(
+            memory_pressure_level_from_raw(0x08),
+            MemoryPressureLevel::Unknown
+        );
+    }
+
+    #[test]
+    fn memory_pressure_sysctl_failure_and_bad_length_are_unknown() {
+        let int_len = std::mem::size_of::<libc::c_int>();
+        assert_eq!(
+            memory_pressure_level_from_sysctl(-1, int_len, 0x04),
+            MemoryPressureLevel::Unknown
+        );
+        assert_eq!(
+            memory_pressure_level_from_sysctl(0, int_len - 1, 0x04),
+            MemoryPressureLevel::Unknown
+        );
+    }
 
     #[test]
     fn nofile_target_raises_low_soft_limit_to_cap_when_hard_is_unlimited() {

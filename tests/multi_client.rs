@@ -875,7 +875,9 @@ fn non_foreground_client_render_preserves_agent_panel_scroll() {
     // The pinned resource footer reserves rows at the bottom of the sidebar,
     // so the agent panel shows one row fewer than it did before it existed and
     // every expected page position below is one agent further down.
-    let wheel_down = b"\x1b[<65;10;30M";
+    // Row 24 is inside the Agents section; the Files tree now sits below it
+    // in the lower sidebar, so wheel input there scrolls Files instead.
+    let wheel_down = b"\x1b[<65;10;24M";
     send_client_input(&mut setup_client, &wheel_down.repeat(20));
     let (reached_bottom, setup_frames) = wait_for_frame_matching_with_snapshots(
         &mut setup_client,
@@ -917,6 +919,82 @@ fn non_foreground_client_render_preserves_agent_panel_scroll() {
         "background client projection must not undo the foreground wheel event; frames:\n{}",
         probe_frames.join("\n--- frame ---\n")
     );
+
+    cleanup_spawned_herdr(server, base);
+}
+
+/// Session mode (background server + thin client): the Files sidebar must be
+/// populated from the selected pane's cwd, exactly as in `--no-session`.
+#[test]
+fn session_mode_files_sidebar_lists_the_pane_cwd_for_every_client() {
+    let _lock = test_lock();
+    let base = unique_test_dir();
+    let config_home = base.join("config");
+    let runtime_dir = base.join("runtime");
+    let api_socket = runtime_dir.join("herdr.sock");
+    let client_socket = runtime_dir.join("herdr-client.sock");
+    let probe = base.join("files-probe");
+    for name in ["probe-alpha", "probe-beta"] {
+        std::fs::create_dir_all(probe.join(name)).expect("probe dir");
+    }
+
+    let server = spawn_server(&config_home, &runtime_dir, &api_socket);
+    wait_for_socket(&api_socket, Duration::from_secs(10));
+    wait_for_file(&client_socket, Duration::from_secs(10));
+
+    let response = send_json_request(
+        &api_socket,
+        &format!(
+            "{{\"id\":\"ws_create\",\"method\":\"workspace.create\",\"params\":{{\"label\":\"files\",\"cwd\":{}}}}}",
+            serde_json::to_string(probe.to_str().expect("utf-8 path")).expect("json path")
+        ),
+    );
+    assert!(
+        response.get("error").is_none(),
+        "workspace.create failed: {response}"
+    );
+
+    let lists_probe = |frame: &FrameWire| {
+        let text = frame_text(frame);
+        text.contains("probe-alpha") && text.contains("probe-beta")
+    };
+    let mut client_a = connect_raw_client(&client_socket, 106, 60);
+    let (listed, frames) =
+        wait_for_frame_matching_with_snapshots(&mut client_a, Duration::from_secs(10), lists_probe)
+            .expect("frame decoding should succeed");
+    assert!(
+        listed,
+        "session client should see the pane cwd in Files; frames:\n{}",
+        frames.join("\n--- frame ---\n")
+    );
+
+    // A second client sees the same server-rendered Files tree.
+    let mut client_b = connect_raw_client(&client_socket, 106, 60);
+    let (listed_b, frames_b) =
+        wait_for_frame_matching_with_snapshots(&mut client_b, Duration::from_secs(10), lists_probe)
+            .expect("frame decoding should succeed");
+    assert!(
+        listed_b,
+        "second client should see Files too; frames:\n{}",
+        frames_b.join("\n--- frame ---\n")
+    );
+
+    // One client leaving does not disturb the server or the other client.
+    send_client_detach(&mut client_b);
+    drop(client_b);
+    send_client_input(&mut client_a, b"echo still-here\n");
+    let (alive, frames_a) =
+        wait_for_frame_matching_with_snapshots(&mut client_a, Duration::from_secs(10), |frame| {
+            frame_text(frame).contains("still-here") && lists_probe(frame)
+        })
+        .expect("frame decoding should succeed");
+    assert!(
+        alive,
+        "remaining client keeps working after the other detaches; frames:\n{}",
+        frames_a.join("\n--- frame ---\n")
+    );
+    send_client_detach(&mut client_a);
+    drop(client_a);
 
     cleanup_spawned_herdr(server, base);
 }

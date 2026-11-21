@@ -1282,6 +1282,8 @@ impl App {
             session_start_source: crate::agent_resume::normalize_session_start_source(
                 params.session_start_source,
             ),
+            permission_mode: params.permission_mode,
+            session_end: params.session_end,
         });
 
         encode_success(id, ResponseResult::Ok {})

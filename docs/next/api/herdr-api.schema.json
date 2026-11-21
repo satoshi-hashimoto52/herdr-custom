@@ -2868,6 +2868,12 @@
             "pane_id": {
               "type": "string"
             },
+            "permission_mode": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
             "seq": {
               "format": "uint64",
               "minimum": 0,
@@ -2875,6 +2881,10 @@
                 "integer",
                 "null"
               ]
+            },
+            "session_end": {
+              "default": false,
+              "type": "boolean"
             },
             "session_start_source": {
               "type": [

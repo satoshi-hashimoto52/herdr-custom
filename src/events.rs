@@ -90,6 +90,8 @@ pub enum AppEvent {
         seq: Option<u64>,
         session_ref: Option<crate::agent_resume::AgentSessionRef>,
         session_start_source: Option<String>,
+        permission_mode: Option<String>,
+        session_end: bool,
     },
     /// Display-only agent metadata was reported for a pane.
     HookMetadataReported {
@@ -151,6 +153,20 @@ pub enum AppEvent {
     GitStatusRefreshed {
         results: Vec<WorkspaceGitStatus>,
         cache_updates: Vec<(std::path::PathBuf, GitStatusCacheEntry)>,
+    },
+    /// A delayed Files-tree directory scan completed for one pane.
+    FilesDirectoryListed {
+        /// The delayed-expansion request this listing answers; it carries the
+        /// pane, root, target and generations re-validated on arrival.
+        request: crate::ui::FilesExpandRequest,
+        result: Result<Vec<crate::ui::FileEntry>, String>,
+    },
+    /// A file information lookup completed for one pane and selection.
+    FileMetadataReady {
+        pane_id: PaneId,
+        generation: u64,
+        path: std::path::PathBuf,
+        result: Result<crate::ui::FileInfo, String>,
     },
     /// A configured tab bar status command finished.
     TabBarCommandFinished {

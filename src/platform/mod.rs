@@ -52,10 +52,34 @@ pub struct MemoryUsage {
     pub total_bytes: u64,
 }
 
+/// System-wide memory pressure reported by the host OS.
+///
+/// This is deliberately separate from [`MemoryUsage`]: macOS derives pressure
+/// from reclaimability, compression, paging, and other VM signals rather than
+/// from a percentage of installed RAM. Unsupported platforms and failed reads
+/// report `Unknown`, which presentation code treats exactly like `Normal`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+// Linux does not currently report memory-pressure levels, so only `Unknown`
+// is constructed there; other platforms still get dead-code warnings.
+#[cfg_attr(
+    target_os = "linux",
+    allow(
+        dead_code,
+        reason = "Linux does not currently report memory-pressure levels"
+    )
+)]
+pub enum MemoryPressureLevel {
+    Normal,
+    Warning,
+    Critical,
+    #[default]
+    Unknown,
+}
+
 /// Host resource pressure sampled from OS APIs, not shelled-out commands.
 ///
-/// Every field stays `None` on platforms without a supported query so callers
-/// can hide the reading instead of rendering a fabricated zero.
+/// Optional readings stay `None` on platforms without a supported query, and
+/// memory pressure stays `Unknown`, so callers never render fabricated data.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct SystemResourceSample {
     /// Space a non-root process can actually claim, excluding APFS purgeable
@@ -67,6 +91,8 @@ pub struct SystemResourceSample {
     pub cpu_ticks: Option<CpuTicks>,
     /// Physical memory in use and installed.
     pub memory: Option<MemoryUsage>,
+    /// System-wide memory pressure, when the OS exposes it.
+    pub memory_pressure: MemoryPressureLevel,
 }
 
 pub(crate) fn detached_custom_command_process(command: &str) -> std::process::Command {

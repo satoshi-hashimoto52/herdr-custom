@@ -101,6 +101,10 @@ pub(crate) fn local_datetime() -> Option<time::PrimitiveDateTime> {
     None
 }
 
+pub(crate) fn local_datetime_at(_unix_seconds: i64) -> Option<time::PrimitiveDateTime> {
+    None
+}
+
 pub(crate) fn status_commands_supported() -> bool {
     false
 }

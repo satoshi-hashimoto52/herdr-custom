@@ -59,6 +59,86 @@ impl App {
     }
 
     pub(crate) fn handle_internal_event_with_render_impact(&mut self, ev: AppEvent) -> bool {
+        if let AppEvent::FilesDirectoryListed { request, result } = ev {
+            let pane_id = request.pane_id;
+            let before = self.state.files_trace_snapshot(pane_id);
+            let outcome = match self.state.files_by_pane.get_mut(&pane_id) {
+                Some(state) => state.apply_listing(&request, result),
+                None => Err("pane_state_missing"),
+            };
+            return match outcome {
+                Ok(()) => {
+                    self.state.trace_files_change(
+                        pane_id,
+                        "delayed-expand-applied",
+                        "listing-applied",
+                        before,
+                    );
+                    true
+                }
+                Err(reason) => {
+                    self.state.trace_files_change(
+                        pane_id,
+                        "delayed-expand-rejected-stale",
+                        reason,
+                        before,
+                    );
+                    if super::input::files_trace::enabled() {
+                        super::input::files_trace::state_change(
+                            "listing-discarded",
+                            reason,
+                            self.state.files_focus,
+                            &format!("target={:?}", request.target),
+                            "unchanged",
+                        );
+                    }
+                    false
+                }
+            };
+        }
+        if let AppEvent::FileMetadataReady {
+            pane_id,
+            generation,
+            path,
+            result,
+        } = ev
+        {
+            // Pane (map key), generation, selection, and the focused
+            // directory (whose direct files are the only selectable ones)
+            // must all still match; anything else is a stale result.
+            let accepted = self
+                .state
+                .files_by_pane
+                .get(&pane_id)
+                .is_some_and(|state| state.accepts_metadata(generation, &path));
+            if super::input::files_trace::enabled() {
+                super::input::files_trace::state_change(
+                    if accepted {
+                        "metadata-apply"
+                    } else {
+                        "metadata-stale-reject"
+                    },
+                    super::input::files_trace::basename(&path),
+                    self.state.files_focus,
+                    &format!("pane={pane_id:?} generation={generation}"),
+                    &format!("ok={}", result.is_ok()),
+                );
+            }
+            if let Some(state) = self.state.files_by_pane.get_mut(&pane_id) {
+                if accepted {
+                    match result {
+                        Ok(info) => {
+                            state.metadata_cache.insert(info.key.clone(), info.clone());
+                            state.info = crate::ui::files::FileInfoState::Ready(info);
+                        }
+                        Err(message) => {
+                            state.info = crate::ui::files::FileInfoState::Error(message);
+                        }
+                    }
+                }
+            }
+            return true;
+        }
         match ev {
             AppEvent::GitStatusRefreshed {
                 results,
@@ -471,7 +551,11 @@ impl App {
             return;
         }
         self.state.copy_feedback = Some(crate::app::state::CopyFeedback {
-            message: "copied to clipboard".to_string(),
+            message: self
+                .state
+                .clipboard_feedback_override
+                .take()
+                .unwrap_or_else(|| "copied to clipboard".to_string()),
         });
         self.copy_feedback_deadline = Some(Instant::now() + super::COPY_FEEDBACK_DURATION);
     }

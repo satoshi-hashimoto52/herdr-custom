@@ -38,6 +38,7 @@ fn modified_url_click_modifier_matches_terminal_mouse_reporting() {
 
 mod clipboard;
 mod copy_mode;
+pub(crate) mod files_trace;
 mod lease;
 mod modal;
 mod mouse;
@@ -75,6 +76,82 @@ use super::App;
 // ---------------------------------------------------------------------------
 
 impl App {
+    /// Keys owned by the Files sidebar: Esc cancels an Agents/Files divider
+    /// drag, and while Files has keyboard focus ↑/↓/j/k move the directory
+    /// cursor, o/Enter open it, p copies its path and Esc returns to the PTY.
+    /// Shared by the monolithic and session-server key paths. Returns whether
+    /// the key was consumed (and so must not reach the PTY).
+    pub(crate) fn handle_files_overlay_key(
+        &mut self,
+        key_event: &crossterm::event::KeyEvent,
+    ) -> bool {
+        use crossterm::event::KeyCode;
+        if key_event.code == KeyCode::Esc && self.state.cancel_files_split_drag() {
+            return true;
+        }
+        let Some(pane_id) = self.state.files_focus else {
+            return false;
+        };
+        let focused_dir = || {
+            self.state
+                .files_by_pane
+                .get(&pane_id)
+                .and_then(|state| state.focused_dir.clone())
+        };
+        // Keys that mirror a Files button light it the same way a click does.
+        let button = match key_event.code {
+            KeyCode::Up | KeyCode::Char('k') => Some(0),
+            KeyCode::Down | KeyCode::Char('j') => Some(1),
+            KeyCode::Char('o') | KeyCode::Enter => Some(2),
+            KeyCode::Char('p') => Some(3),
+            _ => None,
+        };
+        if let Some(index) = button {
+            // Only a usable button lights up, as with the mouse.
+            let enabled = self
+                .state
+                .files_by_pane
+                .get(&pane_id)
+                .is_some_and(|state| crate::ui::files::files_buttons_enabled(state)[index]);
+            self.state.files_button_press = enabled.then(|| {
+                crate::ui::files::FilesButtonPress::new(
+                    pane_id,
+                    index,
+                    false,
+                    std::time::Instant::now(),
+                )
+            });
+        }
+        match key_event.code {
+            KeyCode::Esc => {
+                self.state.files_focus = None;
+                self.state.mode = Mode::Terminal;
+            }
+            KeyCode::Up | KeyCode::Char('k') => self.state.move_files_focus(-1, "keyboard-move"),
+            KeyCode::Down | KeyCode::Char('j') => self.state.move_files_focus(1, "keyboard-move"),
+            KeyCode::Char('p') => {
+                if let Some(path) = focused_dir() {
+                    self.state.request_clipboard_write =
+                        Some(path.to_string_lossy().into_owned().into_bytes());
+                    self.state.clipboard_feedback_override = Some("path copied".into());
+                    self.dispatch_pending_clipboard_write();
+                }
+            }
+            KeyCode::Char('o') | KeyCode::Enter => {
+                if let Some(path) = focused_dir() {
+                    #[cfg(target_os = "macos")]
+                    let _ = std::process::Command::new("open").arg(path).spawn();
+                    #[cfg(target_os = "linux")]
+                    let _ = std::process::Command::new("xdg-open").arg(path).spawn();
+                    #[cfg(target_os = "windows")]
+                    let _ = std::process::Command::new("explorer").arg(path).spawn();
+                }
+            }
+            _ => return false,
+        }
+        true
+    }
+
     pub(super) async fn handle_key(
         &mut self,
         key: TerminalKey,
@@ -83,6 +160,9 @@ impl App {
             return self.handle_terminal_key(key).await;
         }
         let key_event = key.as_key_event();
+        if self.handle_files_overlay_key(&key_event) {
+            return None;
+        }
         if modal_paste_target_active(&self.state) && is_modal_paste_shortcut(&key_event) {
             if let Some(text) = crate::platform::read_clipboard_text() {
                 self.paste_into_active_text_input(&text);
@@ -392,10 +472,20 @@ impl App {
         let previous_agent_panel_sort = self.state.agent_panel_sort;
         let previous_settings_section = self.state.settings.section;
         if !handled_pane_double_click {
-            if let Some(action) =
-                self.state
-                    .handle_mouse(&mut self.terminal_runtimes, source_id, mouse)
-            {
+            let action = self
+                .state
+                .handle_mouse(&mut self.terminal_runtimes, source_id, mouse);
+            files_trace::record_with(|| {
+                format!(
+                    "handle_mouse=returned condition=state_dispatch result={}",
+                    if action.is_some() {
+                        "action"
+                    } else {
+                        "consumed_or_ignored"
+                    }
+                )
+            });
+            if let Some(action) = action {
                 match action {
                     MouseAction::NewWorkspace => {
                         self.begin_tui_workspace_create("tui.mouse.workspace.create")
@@ -424,6 +514,8 @@ impl App {
                         self.focus_pane_internal_via_api(ws_idx, pane_id)
                     }
                     MouseAction::FocusToastTarget => self.focus_toast_target_via_api(),
+                    MouseAction::SaveFilesSplit(split) => self.save_files_split(split),
+                    MouseAction::SaveSpacesSplit(split) => self.save_spaces_split(split),
                     MouseAction::MoveWorkspace {
                         source_ws_idx,
                         insert_idx,
@@ -457,6 +549,9 @@ impl App {
             {
                 self.selection_highlight_clear_deadline = None;
             }
+            if matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left)) {
+                self.start_selected_file_metadata();
+            }
         }
         if previous_settings_section != crate::app::state::SettingsSection::Integrations
             && self.state.settings.section == crate::app::state::SettingsSection::Integrations
@@ -477,6 +572,57 @@ impl App {
             self.selection_autoscroll_deadline =
                 Some(std::time::Instant::now() + super::SELECTION_AUTOSCROLL_INTERVAL);
         }
+    }
+
+    fn start_selected_file_metadata(&mut self) {
+        let Some(pane_id) = self.state.files_focus else {
+            return;
+        };
+        let Some(state) = self.state.files_by_pane.get_mut(&pane_id) else {
+            return;
+        };
+        let Some(path) = state.selected_file.clone() else {
+            return;
+        };
+        // Already shown or on its way: no filesystem access on this click.
+        if matches!(
+            state.info,
+            crate::ui::FileInfoState::Loading | crate::ui::FileInfoState::Ready(_)
+        ) {
+            return;
+        }
+        if let Ok(key) = crate::ui::metadata_key(&path) {
+            if let Some(info) = state.metadata_cache.get(&key).cloned() {
+                state.info = crate::ui::FileInfoState::Ready(info);
+                return;
+            }
+        }
+        let root = state.root.clone();
+        let Ok(runtime) = tokio::runtime::Handle::try_current() else {
+            return;
+        };
+        state.metadata_generation = state.metadata_generation.wrapping_add(1);
+        let generation = state.metadata_generation;
+        state.info = crate::ui::FileInfoState::Loading;
+        if files_trace::enabled() {
+            files_trace::state_change(
+                "metadata-request",
+                files_trace::basename(&path),
+                Some(pane_id),
+                "-",
+                &format!("generation={generation}"),
+            );
+        }
+        let event_tx = self.event_tx.clone();
+        runtime.spawn_blocking(move || {
+            let result = crate::ui::collect_file_metadata_within(&path, root.as_deref());
+            let _ = event_tx.blocking_send(crate::events::AppEvent::FileMetadataReady {
+                pane_id,
+                generation,
+                path,
+                result,
+            });
+        });
     }
 
     fn handle_popup_mouse(&mut self, mouse: MouseEvent) {

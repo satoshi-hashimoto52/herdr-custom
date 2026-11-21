@@ -3,7 +3,7 @@
 # managed by herdr; reinstalling or updating the integration overwrites this file.
 # add custom hooks beside this file instead of editing it.
 # HERDR_INTEGRATION_ID=claude
-# HERDR_INTEGRATION_VERSION=8
+# HERDR_INTEGRATION_VERSION=9
 
 set -eu
 
@@ -74,6 +74,11 @@ if agent_session_id:
         "seq": report_seq,
         "agent_session_id": agent_session_id,
     }
+    permission_mode = hook_input.get("permission_mode")
+    if isinstance(permission_mode, str) and permission_mode:
+        params["permission_mode"] = permission_mode
+    if hook_event_name == "SessionEnd":
+        params["session_end"] = True
     if agent_session_path:
         params["agent_session_path"] = agent_session_path
     if session_start_source:

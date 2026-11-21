@@ -24,6 +24,26 @@ pub struct HookAuthority {
     pub session_ref: Option<crate::agent_resume::AgentSessionRef>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ClaudePermissionMode {
+    Bypass,
+    Standard,
+    Unknown,
+}
+
+fn claude_permission_mode(value: &str) -> ClaudePermissionMode {
+    if value == "bypassPermissions" {
+        ClaudePermissionMode::Bypass
+    } else if matches!(
+        value,
+        "default" | "manual" | "plan" | "acceptEdits" | "auto" | "dontAsk"
+    ) {
+        ClaudePermissionMode::Standard
+    } else {
+        ClaudePermissionMode::Unknown
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct SuppressedFullLifecycleHookReport {
     agent_label: String,
@@ -134,6 +154,8 @@ pub struct TerminalState {
     pub agent_metadata: HashMap<String, AgentMetadata>,
     pub metadata_tokens: crate::metadata_tokens::MetadataTokens,
     pub persisted_agent_session: Option<crate::agent_resume::PersistedAgentSession>,
+    pub claude_permission_mode: Option<ClaudePermissionMode>,
+    claude_permission_session_ref: Option<crate::agent_resume::AgentSessionRef>,
     pub terminal_title: Option<String>,
     pub manual_label: Option<String>,
     pub agent_name: Option<String>,
@@ -168,6 +190,8 @@ impl TerminalState {
             agent_metadata: HashMap::new(),
             metadata_tokens: crate::metadata_tokens::MetadataTokens::default(),
             persisted_agent_session: None,
+            claude_permission_mode: None,
+            claude_permission_session_ref: None,
             terminal_title: None,
             manual_label: None,
             agent_name: None,
@@ -1397,6 +1421,42 @@ impl TerminalState {
         self.persisted_agent_session = Some(session);
     }
 
+    pub fn update_claude_permission_mode(
+        &mut self,
+        session_ref: Option<&crate::agent_resume::AgentSessionRef>,
+        permission_mode: Option<&str>,
+        session_end: bool,
+    ) -> Option<TerminalStateMutation> {
+        let session_ref = session_ref?;
+        let matches_current =
+            self.current_session_identity_for_persistence()
+                .is_some_and(|(_, _, kind, value)| {
+                    kind == session_ref.kind && value == session_ref.value
+                });
+        if !matches_current {
+            return None;
+        }
+        let previous = self.claude_permission_mode;
+        if self
+            .claude_permission_session_ref
+            .as_ref()
+            .is_some_and(|previous| previous != session_ref)
+        {
+            self.claude_permission_mode = None;
+        }
+        if session_end {
+            self.claude_permission_mode = None;
+            self.claude_permission_session_ref = None;
+        } else if let Some(mode) = permission_mode {
+            self.claude_permission_session_ref = Some(session_ref.clone());
+            self.claude_permission_mode = Some(claude_permission_mode(mode));
+        }
+        (previous != self.claude_permission_mode).then(|| TerminalStateMutation {
+            effective_state_change: Some(self.unchanged_effective_state_change_at(Instant::now())),
+            ..Default::default()
+        })
+    }
+
     pub fn set_agent_session_ref(
         &mut self,
         source: String,
@@ -1740,6 +1800,8 @@ impl TerminalState {
         );
         self.hook_authority = None;
         self.persisted_agent_session = None;
+        self.claude_permission_mode = None;
+        self.claude_permission_session_ref = None;
         Some(TerminalStateMutation {
             effective_state_change: self.recompute_effective_state(
                 previous_agent_label,
@@ -1801,6 +1863,8 @@ impl TerminalState {
             self.clear_agent_name();
         }
         self.hook_authority = None;
+        self.claude_permission_mode = None;
+        self.claude_permission_session_ref = None;
         if !preserve_foreign_persisted_session {
             self.persisted_agent_session = None;
         }
@@ -2215,6 +2279,61 @@ mod tests {
             .join(name)
             .display()
             .to_string()
+    }
+
+    #[test]
+    fn claude_permission_mode_parser_is_fail_safe() {
+        assert_eq!(
+            claude_permission_mode("bypassPermissions"),
+            ClaudePermissionMode::Bypass
+        );
+        for mode in [
+            "default",
+            "manual",
+            "plan",
+            "acceptEdits",
+            "auto",
+            "dontAsk",
+        ] {
+            assert_eq!(claude_permission_mode(mode), ClaudePermissionMode::Standard);
+        }
+        assert_eq!(
+            claude_permission_mode("futureMode"),
+            ClaudePermissionMode::Unknown
+        );
+    }
+
+    #[test]
+    fn claude_permission_mode_is_scoped_to_session_and_cleared_on_end() {
+        let mut terminal = test_terminal();
+        let first = crate::agent_resume::AgentSessionRef::id("first").unwrap();
+        terminal.set_persisted_agent_session(crate::agent_resume::PersistedAgentSession {
+            source: "herdr:claude".into(),
+            agent: "claude".into(),
+            session_ref: first.clone(),
+        });
+        terminal.update_claude_permission_mode(Some(&first), Some("bypassPermissions"), false);
+        assert_eq!(
+            terminal.claude_permission_mode,
+            Some(ClaudePermissionMode::Bypass)
+        );
+        terminal.update_claude_permission_mode(Some(&first), None, false);
+        assert_eq!(
+            terminal.claude_permission_mode,
+            Some(ClaudePermissionMode::Bypass)
+        );
+
+        let second = crate::agent_resume::AgentSessionRef::id("second").unwrap();
+        terminal.persisted_agent_session = Some(crate::agent_resume::PersistedAgentSession {
+            source: "herdr:claude".into(),
+            agent: "claude".into(),
+            session_ref: second.clone(),
+        });
+        terminal.update_claude_permission_mode(Some(&second), None, false);
+        assert_eq!(terminal.claude_permission_mode, None);
+        terminal.update_claude_permission_mode(Some(&second), Some("bypassPermissions"), false);
+        terminal.update_claude_permission_mode(Some(&second), None, true);
+        assert_eq!(terminal.claude_permission_mode, None);
     }
 
     fn anchor_full_lifecycle_session(
