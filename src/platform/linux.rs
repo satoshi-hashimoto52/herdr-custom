@@ -819,6 +819,8 @@ fn memory_usage_from_meminfo(meminfo: &str) -> Option<MemoryUsage> {
 
 /// Space available to an unprivileged process, matching `df`.
 fn available_disk_bytes(path: &std::path::Path) -> Option<u64> {
+    use std::os::unix::ffi::OsStrExt;
+
     let path = std::ffi::CString::new(path.as_os_str().as_bytes()).ok()?;
     let mut stat = std::mem::MaybeUninit::<libc::statvfs>::uninit();
     // SAFETY: `path` is a valid NUL-terminated C string and `stat` is a
